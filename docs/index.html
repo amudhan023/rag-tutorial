@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>RAG From Scratch → Production</title>
+<meta name="description" content="A plain-English, visual walkthrough of building a Retrieval-Augmented Generation system — from a from-scratch TF-IDF prototype to a production Postgres+pgvector pipeline." />
+<link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="dot"></span> RAG From Scratch → Production</a>
+    <nav class="topnav">
+      <a href="#notebooks">Notebooks</a>
+      <a href="#concepts">Concepts</a>
+      <a href="notebook1.html">Notebook 1</a>
+      <a href="notebook2.html">Notebook 2</a>
+      <a href="notebook3.html">Notebook 3</a>
+    </nav>
+  </div>
+</div>
+
+<div class="page">
+
+  <div class="hero">
+    <span class="eyebrow">Documentation</span>
+    <h1>Build a Search Assistant Over Your Own Documents — Explained for Beginners</h1>
+    <p class="lede">
+      This site explains, in plain English with diagrams, how to build <strong>Retrieval-Augmented
+      Generation (RAG)</strong> — a way to make an AI model answer questions using your own private
+      documents instead of guessing from memory. Three notebooks build the same idea three times, each
+      one fixing a real weakness in the last: a from-scratch prototype, a modern semantic version, and a
+      production-grade database-backed version. No ML background needed, no code shown — just problems,
+      reasons, and pictures.</p>
+    <div class="hero-meta">
+      <span class="pill accent">3 notebooks</span>
+      <span class="pill teal">Zero AI/ML background required</span>
+      <span class="pill purple">Concepts + deep dives below</span>
+    </div>
+  </div>
+
+  <section class="block" id="notebooks">
+    <h2>Start here — pick a notebook</h2>
+    <p class="section-sub">Read them in order — each one fixes the previous one's failures.</p>
+
+    <div class="card-grid">
+      <a class="nb-card" href="notebook1.html">
+        <div class="nb-num">Notebook 1 of 3</div>
+        <h3>Build RAG From Scratch</h3>
+        <p>Turn text into numbers with TF-IDF and hand-write a search engine — then watch it fail on
+        synonyms and word collisions. Learn the whole pipeline in the open, no black boxes.</p>
+        <span class="go">Read the walkthrough →</span>
+      </a>
+      <a class="nb-card" href="notebook2.html">
+        <div class="nb-num">Notebook 2 of 3</div>
+        <h3>Modern Semantic RAG</h3>
+        <p>Swap in neural embeddings that understand meaning, add a fast search index (FAISS), a
+        re-ranker, and hybrid keyword+meaning search — fixing both of Notebook 1's failures.</p>
+        <span class="go">Read the walkthrough →</span>
+      </a>
+      <a class="nb-card" href="notebook3.html">
+        <div class="nb-num">Notebook 3 of 3</div>
+        <h3>Production RAG With a Real Database</h3>
+        <p>Move everything into Postgres + pgvector: durable storage, fast approximate search, hybrid
+        search in pure SQL, formal evaluation metrics, and production monitoring.</p>
+        <span class="go">Read the walkthrough →</span>
+      </a>
+    </div>
+  </section>
+
+  <hr class="hr" />
+
+  <section class="block" id="concepts">
+    <h2>Concepts &amp; deep dives</h2>
+    <p class="section-sub">
+      The core ideas behind every notebook, explained once, step by step. You can read these instead of —
+      or in addition to — the full per-notebook pages. Some overlap with the notebook pages on purpose:
+      this is the "quick reference" version, those are the "full story" version.</p>
+
+    <div class="card-grid">
+      <div class="concept-card">
+        <div class="icon">🔍</div>
+        <h3>What is RAG, really?</h3>
+        <p><strong>Problem:</strong> AI models don't know your private documents and will confidently
+        guess if you ask about them.</p>
+        <p><strong>Why:</strong> Retraining a model on your documents is slow and expensive.</p>
+        <p><strong>What:</strong> Instead, find the relevant paragraphs yourself and paste them into the
+        question you ask the model — an "open book exam" instead of a "closed book exam."</p>
+        <div class="diagram" style="padding:16px; margin-top:10px;">
+          <div class="flow vertical">
+            <div class="flow-step accent">Your question</div>
+            <div class="flow-arrow">↓</div>
+            <div class="flow-step teal">Find matching paragraphs (Retrieval)</div>
+            <div class="flow-arrow">↓</div>
+            <div class="flow-step orange">Paste them into a prompt (Augmentation)</div>
+            <div class="flow-arrow">↓</div>
+            <div class="flow-step purple">AI answers using only that text (Generation)</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <div class="icon">✂️</div>
+        <h3>Chunking &amp; overlap</h3>
+        <p><strong>Problem:</strong> Whole documents are too big and unfocused to search well.</p>
+        <p><strong>What:</strong> Cut documents into small overlapping windows of text so search results
+        are precise, and important phrases never get sliced in half at a chunk boundary.</p>
+        <div class="chip-row">
+          <span class="chip overlap">...restart the deployment: kubectl rollout restart</span>
+          <span class="chip overlap">kubectl rollout restart deployment payment-api...</span>
+        </div>
+        <p style="font-size:12.5px; color:var(--text-mute); margin-top:6px;">↑ overlap keeps the full command readable in both chunks.</p>
+      </div>
+
+      <div class="concept-card">
+        <div class="icon">🔢</div>
+        <h3>Embeddings — turning text into numbers</h3>
+        <p><strong>Problem:</strong> Computers can't compare "meaning" directly.</p>
+        <p><strong>What:</strong> An embedding is a list of numbers standing in for a piece of text, built
+        so that texts with similar meaning end up with nearby numbers. TF-IDF counts exact words; neural
+        embeddings learn to represent meaning, including synonyms.</p>
+        <table class="cmp">
+          <thead><tr><th>Method</th><th>Understands</th><th>Readable?</th></tr></thead>
+          <tbody>
+            <tr><td>TF-IDF</td><td>Exact words only</td><td>Yes — one number per word</td></tr>
+            <tr><td>Neural (sentence-transformer)</td><td>Meaning &amp; synonyms</td><td>No — a black box</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="concept-card">
+        <div class="icon">📐</div>
+        <h3>Cosine similarity — how "close" is measured</h3>
+        <p><strong>Problem:</strong> Given two lists of numbers, how do you decide if they mean similar
+        things?</p>
+        <p><strong>What:</strong> Picture each list of numbers as an arrow. Cosine similarity measures the
+        angle between two arrows — a small angle (pointing the same way) means very similar; a wide angle
+        means unrelated. It ignores how long each arrow is.</p>
+        <div class="venn">
+          <div class="circle a">query<br/>vector</div>
+          <div class="circle b">chunk<br/>vector</div>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <div class="icon">🗄️</div>
+        <h3>Vector databases — not as magical as they sound</h3>
+        <p><strong>Problem:</strong> "Vector database" sounds complicated.</p>
+        <p><strong>What:</strong> Underneath, it does two jobs: store (vector + info about it), and given a
+        new vector, return the closest matches. A plain Python list with a for-loop already does this — real
+        databases (FAISS, pgvector) just make it fast at millions of rows using indexes like HNSW.</p>
+      </div>
+
+      <div class="concept-card">
+        <div class="icon">🧩</div>
+        <h3>Why exact word-matching isn't enough</h3>
+        <p><strong>Problem:</strong> "The message bus is falling behind" means the same thing as "Kafka
+        consumer lag is increasing" — but shares zero exact words.</p>
+        <p><strong>What:</strong> Word-counting methods (TF-IDF, keyword search) score this pair at
+        ≈0.000 similarity. Meaning-based embeddings fix it by placing synonyms near each other in
+        number-space, regardless of the exact words used.</p>
+        <div class="bars">
+          <div class="bar-row"><span class="label">TF-IDF score</span><div class="track"><div class="fill" style="width:1%"></div></div><span class="val">0.00</span></div>
+          <div class="bar-row"><span class="label">Neural embedding score</span><div class="track"><div class="fill" style="width:78%"></div></div><span class="val">0.81</span></div>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <div class="icon">🎯</div>
+        <h3>Re-ranking — fixing false matches</h3>
+        <p><strong>Problem:</strong> "Customers see failures at checkout" can retrieve a Kubernetes
+        document just because both mention the word "failures," even though it's about a payment issue.</p>
+        <p><strong>What:</strong> A first-pass search casts a wide, fast net (bi-encoder); a slower,
+        smarter second pass (cross-encoder) reads the query and each candidate <em>together</em> and
+        re-orders them by true relevance, catching matches that share words but not context.</p>
+      </div>
+
+      <div class="concept-card">
+        <div class="icon">🤝</div>
+        <h3>Hybrid search — best of both worlds</h3>
+        <p><strong>Problem:</strong> Keyword search is great at exact terms (error codes, product names);
+        meaning-based search is great at paraphrases. Neither wins every case.</p>
+        <p><strong>What:</strong> Run both searches, then blend their rankings into one combined result —
+        either by weighting scores, or with Reciprocal Rank Fusion (RRF), which combines rankings without
+        needing the two searches' scores to be on the same scale.</p>
+        <div class="diagram" style="padding:16px; margin-top:10px;">
+          <div class="flow">
+            <div class="flow-step teal">Keyword search<span class="sub">exact terms</span></div>
+            <div class="flow-arrow">+</div>
+            <div class="flow-step purple">Meaning search<span class="sub">paraphrases</span></div>
+            <div class="flow-arrow">=</div>
+            <div class="flow-step accent">Hybrid ranking<span class="sub">best of both</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <div class="icon">⚡</div>
+        <h3>Approximate search (HNSW) — speed vs. accuracy</h3>
+        <p><strong>Problem:</strong> Checking every single stored vector one-by-one (brute force) is too
+        slow once you have millions of documents.</p>
+        <p><strong>What:</strong> HNSW is an index that finds <em>almost always</em> the same top matches as
+        brute force, but far faster, by pre-building shortcuts through the data. The trade-off is tunable —
+        search wider (slower, more accurate) or narrower (faster, occasionally misses a match).</p>
+        <div class="bars">
+          <div class="bar-row"><span class="label">narrow search</span><div class="track"><div class="fill" style="width:91%"></div></div><span class="val">91% recall</span></div>
+          <div class="bar-row"><span class="label">medium search</span><div class="track"><div class="fill" style="width:99%"></div></div><span class="val">99% recall</span></div>
+          <div class="bar-row"><span class="label">wide search</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="val">100% recall</span></div>
+        </div>
+      </div>
+
+      <div class="concept-card">
+        <div class="icon">📊</div>
+        <h3>How do you measure if search is any good?</h3>
+        <p><strong>Problem:</strong> "It feels like it's working" isn't good enough for a production
+        system.</p>
+        <p><strong>What:</strong> Build a small test set of real questions with known correct answers, then
+        score every search configuration against it with metrics like <strong>hit@1</strong> (did the top
+        result match?), <strong>recall@k</strong>, <strong>MRR</strong>, and <strong>nDCG</strong> — so
+        improvements are proven with numbers, not vibes.</p>
+      </div>
+
+      <div class="concept-card">
+        <div class="icon">🚨</div>
+        <h3>Knowing when to say "I don't know"</h3>
+        <p><strong>Problem:</strong> If someone asks an out-of-scope question, search still returns its
+        "closest" match — even if nothing in the documents is actually relevant — and the AI may
+        confidently answer from a bad match anyway.</p>
+        <p><strong>What:</strong> In-scope questions score noticeably higher than out-of-scope ones. Setting
+        a similarity-score threshold, and explicitly permitting the model to refuse, turns silent guessing
+        into an honest "I don't have information on that."</p>
+      </div>
+    </div>
+  </section>
+
+  <div class="pagenav">
+    <a class="prev" href="notebook1.html">
+      <div class="dir">Start</div>
+      <div class="name">← Notebook 1 — Build RAG From Scratch</div>
+    </a>
+    <a class="next" href="notebook3.html">
+      <div class="dir">Production</div>
+      <div class="name">Notebook 3 — Production RAG →</div>
+    </a>
+  </div>
+
+</div>
+
+<footer class="site">
+  RAG From Scratch → Production — a 3-notebook walkthrough of building, improving, and productionizing a Retrieval-Augmented Generation search system.
+</footer>
+
+</body>
+</html>

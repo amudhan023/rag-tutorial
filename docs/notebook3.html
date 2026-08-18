@@ -1,0 +1,1066 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Notebook 3 — Production RAG (pgvector, HNSW, evaluation, observability)</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="dot"></span> RAG From Scratch → Production</a>
+    <nav class="topnav">
+      <a href="index.html#notebooks">Notebooks</a>
+      <a href="index.html#concepts">Concepts</a>
+      <a href="notebook1.html">Notebook 1</a>
+      <a href="notebook2.html">Notebook 2</a>
+    </nav>
+  </div>
+</div>
+
+<div class="page">
+
+  <section class="hero">
+    <span class="eyebrow">NOTEBOOK 3 OF 3</span>
+    <h1>Production RAG: PostgreSQL, pgvector, and the numbers that keep it honest</h1>
+    <p class="lede">
+      Notebook 1 proved a from-scratch search engine finds words, not meaning. Notebook 2 fixed that with
+      embeddings, FAISS, re-ranking, and hybrid search — but everything lived in a Python variable that
+      vanishes the moment the process restarts. This notebook takes that working demo and turns it into a
+      service you could actually put on call for: a real database that never forgets, an index that trades
+      a sliver of accuracy for a lot of speed (and gets measured doing it), a single SQL query that fuses
+      keyword and meaning search, scorecards that say precisely how good the retrieval is, and alarms that
+      catch the failures a demo never shows you.
+    </p>
+    <div class="hero-meta">
+      <span class="pill accent">PostgreSQL + pgvector</span>
+      <span class="pill teal">HNSW approximate search</span>
+      <span class="pill purple">Hybrid search via RRF-in-SQL</span>
+      <span class="pill orange">Precision / Recall / MRR / nDCG</span>
+      <span class="pill">Latency percentiles &amp; alarms</span>
+    </div>
+  </section>
+
+  <div class="section-nav-jump">
+    <a href="#s0">Why a database</a>
+    <a href="#s1">Getting Postgres running</a>
+    <a href="#s2">Schema design</a>
+    <a href="#s3">Ingestion &amp; dedup</a>
+    <a href="#s4">Vector search in SQL</a>
+    <a href="#s5">HNSW trade-off</a>
+    <a href="#s5b">The benchmark trap</a>
+    <a href="#s6">Hybrid search in SQL</a>
+    <a href="#s7">Evaluation metrics</a>
+    <a href="#s8">Observability</a>
+    <a href="#s9">Putting it together</a>
+    <a href="#recap">What you built</a>
+  </div>
+
+  <div class="layout-2col">
+    <nav class="toc">
+      <div class="toc-title">On this page</div>
+      <a href="#s0">0. Why a real database</a>
+      <a href="#s1">1. Getting Postgres running</a>
+      <a href="#s2">2. Schema design</a>
+      <a href="#s3">3. Ingestion &amp; dedup</a>
+      <a href="#s4">4. Vector search in SQL</a>
+      <a href="#s5">5. HNSW trade-off</a>
+      <a href="#s5b">5.2 The benchmark trap</a>
+      <a href="#s6">6. Hybrid search in SQL</a>
+      <a href="#s7">7. Evaluation, from scratch</a>
+      <a href="#s8">8. Observability</a>
+      <a href="#s9">9. Putting it together</a>
+      <a href="#recap">What you built</a>
+    </nav>
+
+    <main>
+
+      <!-- ============ SECTION 0 ============ -->
+      <section class="block" id="s0">
+        <div class="cell">
+          <div class="cell-head">
+            <span class="cell-index">§0</span>
+            <span class="cell-title">Why bother with a real database at all?</span>
+          </div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem">
+                <span class="tag">Problem</span>
+                <span class="txt">Notebook 2's search engine lived entirely inside a running Python
+                process — a Python list of vectors plus a FAISS index sitting in RAM. The moment that
+                process restarts (a crash, a deploy, a laptop closing), every embedding is gone and has to
+                be recomputed from scratch. At 3am, during an incident, "restart the search service and
+                wait five minutes while it re-embeds everything" is not an acceptable answer.</span>
+              </div>
+              <div class="row why">
+                <span class="tag">Why</span>
+                <span class="txt">A demo only has to survive one session. A production service has to
+                survive crashes, deploys, multiple servers reading the same data at once, and someone
+                needing to filter results by <code>service = 'payment'</code> without writing custom code
+                for it. FAISS was never designed to solve any of that — it is a very good <strong>index</strong>,
+                not a <strong>database</strong>.</span>
+              </div>
+              <div class="row what">
+                <span class="tag">What</span>
+                <span class="txt">Think of the difference like a chef's private notecards versus a
+                restaurant's actual recipe binder kept in the office safe. The notecards (FAISS) are fast
+                to flip through, but if the chef goes home, they go with them. The binder (a database) is
+                durable — it survives staff turnover, it's the one shared copy everyone works from, and
+                you can flip straight to "all seafood dishes" instead of reading every page. This notebook
+                swaps the notecards for <strong>PostgreSQL</strong>, a real database, extended with
+                <strong>pgvector</strong> — a plugin that teaches Postgres how to store and search the
+                numeric "meaning fingerprints" (embeddings) from Notebook 2 as a native column type.</span>
+              </div>
+              <div class="row how">
+                <span class="tag">How</span>
+                <span class="txt">The notebook doesn't change what gets embedded or how similarity is
+                measured — that logic from Notebook 2 stays the same. What changes is <em>where it all
+                lives</em>: chunk text, its embedding, and metadata like <code>service</code> and
+                <code>severity</code> move into one row of one Postgres table, instead of three parallel
+                Python lists that can silently drift out of sync with each other.</span>
+              </div>
+            </div>
+
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>FAISS is like a search engine's fast cache that lives only in your computer's memory —
+              great while it's running, gone the instant power is cut. A database is the permanent
+              filing cabinet: slower to add a new sheet of paper to, but it's still there tomorrow, and
+              two people can open different drawers of it at the same time without stepping on each
+              other.</p>
+            </div>
+
+            <div class="example-box">
+              <span class="label">What a database buys you, concretely</span>
+              <p>The notebook lists five things FAISS cannot give you that Postgres can: <strong>durability</strong>
+              (survive a restart without re-embedding), <strong>transactions</strong> ("either the whole
+              runbook and its metadata save together, or neither does" — no half-written rows),
+              <strong>rich filtering</strong> (a real <code>WHERE service = 'payment' AND updated_at &gt;
+              now() - interval '90 days'</code> instead of hand-slicing numpy arrays), <strong>one source
+              of truth</strong> (text, vector, and metadata in the same row — no separate "vector store"
+              that can fall out of sync with the "metadata store"), and <strong>operational maturity</strong>
+              — backups, replication, monitoring your organization already knows how to run.</p>
+            </div>
+
+            <div class="callout tip">
+              <span class="label">Honest trade-off</span>
+              <p>A dedicated vector database (Milvus, Qdrant, Pinecone) will out-perform pgvector at truly
+              massive scale. But pgvector's real pitch is that it's <em>already in your stack</em> —
+              for an incident-response tool handling thousands of runbook chunks, not billions, "one
+              fewer system to keep alive during an outage" beats squeezing out the last drop of raw speed.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ SECTION 1 ============ -->
+      <section class="block" id="s1">
+        <div class="cell">
+          <div class="cell-head">
+            <span class="cell-index">§1</span>
+            <span class="cell-title">Standing up Postgres + pgvector</span>
+          </div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem">
+                <span class="tag">Problem</span>
+                <span class="txt">Before any of the ideas above are useful, an actual Postgres server
+                with the pgvector extension has to be running somewhere the notebook can connect to.</span>
+              </div>
+              <div class="row why">
+                <span class="tag">Why</span>
+                <span class="txt">The notebook is deliberately written to work two ways, because the
+                people learning from it are in two different situations: some have their own machine
+                where they can run a persistent database, others are just running cells in Colab and want
+                zero setup.</span>
+              </div>
+              <div class="row what">
+                <span class="tag">What</span>
+                <span class="txt"><strong>Path A (Docker, recommended):</strong> runs Postgres in a
+                container on your own machine, with a named storage volume — meaning the data survives
+                a restart of the container itself, not just the notebook. <strong>Path B (Colab):</strong>
+                installs Postgres directly inside the temporary Colab virtual machine. It works with zero
+                setup, but the whole VM — database included — disappears when the Colab session ends.
+                That's a fine trade for learning, useless for anything real.</span>
+              </div>
+              <div class="row how">
+                <span class="tag">How</span>
+                <span class="txt">A single config flag, <code>USE_DOCKER</code>, tells the rest of the
+                notebook which path to use, so every later cell connects the same way regardless of which
+                path you picked.</span>
+              </div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>Docker with a named volume is like renting a storage unit for your filing cabinet — pay
+              once, it's there next month. The Colab path is like borrowing a filing cabinet from a hotel
+              room: convenient right now, thrown out when you check out.</p>
+            </div>
+            <div class="diagram">
+              <div class="flow">
+                <div class="flow-step accent">Pick a path<span class="sub">Docker or Colab</span></div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step">Postgres server starts<span class="sub">+ pgvector extension</span></div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step teal">Notebook connects<span class="sub">psycopg2</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ SECTION 2 ============ -->
+      <section class="block" id="s2">
+        <div class="cell">
+          <div class="cell-head">
+            <span class="cell-index">§2</span>
+            <span class="cell-title">Designing the table: every column is a decision</span>
+          </div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem">
+                <span class="tag">Problem</span>
+                <span class="txt">A database table isn't just "a place to dump data" — get the columns
+                wrong and you bake in bugs that only surface months later, when someone changes the
+                embedding model and nothing warns them the old and new vectors are now incomparable.</span>
+              </div>
+              <div class="row why">
+                <span class="tag">Why</span>
+                <span class="txt">Notebook 1's quiz raised exactly this failure mode as a thought
+                experiment: mix vectors from two different embedding models in the same search space and
+                you get confident, wrong answers with no error message. A well-designed schema turns that
+                theoretical risk into something you can catch with one query.</span>
+              </div>
+              <div class="row what">
+                <span class="tag">What</span>
+                <span class="txt">The table <code>runbook_chunks</code> stores one row per chunk of
+                runbook text, with the chunk's content, its embedding, and metadata to filter on, all
+                side by side. An <strong>index</strong> in a database means exactly what an index means in
+                the back of a textbook: instead of Postgres reading every single row to answer
+                "show me all payment-service chunks," it flips straight to the right pages.</span>
+              </div>
+              <div class="row how">
+                <span class="tag">How</span>
+                <span class="txt">The schema fixes the embedding's size (384 numbers) as part of the
+                table definition, stamps every row with which embedding model produced it, stores
+                <code>service</code> and <code>severity</code> as their own filterable columns rather than
+                buried in a text blob, keeps a <code>content_hash</code> fingerprint of the text for
+                deduplication, and records <code>updated_at</code> so stale runbooks can be flagged.</span>
+              </div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>Imagine designing a library card for every book: title, shelf location, and a barcode.
+              If you forgot to record "which edition," a librarian pulling the wrong edition during a fire
+              drill wouldn't even know it was wrong. Every column here exists to prevent one specific
+              future mistake.</p>
+            </div>
+            <div class="example-box">
+              <span class="label">The five columns worth defending in a design review</span>
+              <div class="stack">
+                <div class="stack-item"><span class="k">embedding vector(384)</span><span class="v">size locked in at creation — changing models means a migration, not a flag flip</span></div>
+                <div class="stack-item"><span class="k">embedding_model</span><span class="v">stamps which model made this vector — lets you find stale rows with a WHERE clause</span></div>
+                <div class="stack-item"><span class="k">service, severity</span><span class="v">real columns, not buried JSON — so they can have their own fast index</span></div>
+                <div class="stack-item"><span class="k">content_hash</span><span class="v">dedup fingerprint — skip re-embedding text that hasn't changed</span></div>
+                <div class="stack-item"><span class="k">updated_at</span><span class="v">enables recency filters and "this runbook is stale" alerts</span></div>
+              </div>
+            </div>
+            <div class="callout win">
+              <span class="label">Full-text search rides along for free</span>
+              <p>One of the indexes built here is a <code>GIN</code> index over the chunk text — Postgres's
+              built-in keyword search. It means the BM25-style keyword ranking from Notebook 2 can happen
+              <em>inside the database</em> in Section 6, instead of running as a second Python process that
+              can silently drift out of sync with the vector data.</p>
+            </div>
+            <details class="code-toggle">
+              <summary>Peek at the table shape (illustrative, not the full DDL)</summary>
+              <pre>runbook_chunks(
+  chunk_id, content, content_hash,
+  service, severity,
+  embedding vector(384), embedding_model,
+  updated_at
+)</pre>
+            </details>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ SECTION 3 ============ -->
+      <section class="block" id="s3">
+        <div class="cell">
+          <div class="cell-head">
+            <span class="cell-index">§3</span>
+            <span class="cell-title">Loading the runbooks — and never paying twice for the same text</span>
+          </div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem">
+                <span class="tag">Problem</span>
+                <span class="txt">Ingestion pipelines get re-run — a deploy retriggers them, someone
+                fixes a typo in one runbook and reruns the whole batch. Run a naive ingestion script twice
+                and you get every chunk duplicated, which quietly poisons search results: the same chunk
+                now occupies two, three, four of your top-k slots instead of leaving room for genuinely
+                different evidence.</span>
+              </div>
+              <div class="row why">
+                <span class="tag">Why</span>
+                <span class="txt">Turning text into an embedding costs real compute time and, with a
+                hosted embedding API, real money. Re-embedding thousands of unchanged runbook chunks every
+                time a deploy pipeline runs is waste that compounds — the notebook's own framing:
+                "at scale this is the difference between $0.20 and $200."</span>
+              </div>
+              <div class="row what">
+                <span class="tag">What</span>
+                <span class="txt">The fix is making ingestion <strong>idempotent</strong> — a fancy word
+                for "running it twice has the same effect as running it once." The database is told:
+                if a row with this <code>chunk_id</code> already exists, only touch it if the content
+                actually changed (checked via the <code>content_hash</code> fingerprint); otherwise leave
+                it alone.</span>
+              </div>
+              <div class="row how">
+                <span class="tag">How</span>
+                <span class="txt">Same five runbooks, same cleaning and chunking as Notebooks 1–2, but
+                written with an <code>ON CONFLICT ... DO UPDATE</code> clause guarded by
+                <code>WHERE content_hash IS DISTINCT FROM</code> the new hash — so an unchanged chunk is
+                skipped entirely, and a genuinely edited chunk gets its embedding recomputed and its
+                <code>updated_at</code> timestamp bumped.</span>
+              </div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>It's a fingerprint check at the door. If the runbook text coming in has the exact same
+              fingerprint as what's already stored, the database says "already got this one" and skips the
+              expensive work of re-embedding it. Only genuinely new or edited text does the expensive work.</p>
+            </div>
+            <div class="example-box">
+              <span class="label">Worked example: re-running ingestion on an unchanged corpus</span>
+              <p>The notebook re-runs ingestion a second time over the same 5 runbooks and checks, chunk by
+              chunk, whether the stored <code>content_hash</code> matches the freshly computed one. Every
+              chunk that matches is an embedding call avoided entirely. The notebook's own comment on the
+              payoff: <em>"Embedding calls avoided: (unchanged count) — at scale this is the difference
+              between $0.20 and $200."</em> Row count after the re-run is identical to before — nothing
+              was duplicated.</p>
+            </div>
+            <div class="diagram">
+              <div class="flow">
+                <div class="flow-step">Ingest runbooks<span class="sub">chunk + hash text</span></div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step accent">Hash matches existing row?</div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step teal">Yes → skip<span class="sub">no re-embed</span></div>
+              </div>
+              <div class="flow" style="margin-top:10px;">
+                <div class="flow-step accent">Hash matches existing row?</div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step purple">No → embed + upsert<span class="sub">bump updated_at</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ SECTION 4 ============ -->
+      <section class="block" id="s4">
+        <div class="cell">
+          <div class="cell-head">
+            <span class="cell-index">§4</span>
+            <span class="cell-title">Asking Postgres "which chunks are closest in meaning?"</span>
+          </div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem">
+                <span class="tag">Problem</span>
+                <span class="txt">In Notebook 2, doing vector similarity search plus filtering by
+                <code>service</code> meant slicing numpy arrays by hand in Python and juggling candidate
+                ID lists. That's extra code to get wrong, and it's a second system that has to agree with
+                the database about what's true.</span>
+              </div>
+              <div class="row why">
+                <span class="tag">Why</span>
+                <span class="txt">pgvector adds vector math directly into SQL, so "find the closest
+                vectors" and "only look at payment-service rows" can be answered by the database in a
+                single query — the same engine, the same query plan, no hand-off between two systems.</span>
+              </div>
+              <div class="row what">
+                <span class="tag">What</span>
+                <span class="txt">pgvector adds three "distance operators" — symbols that mean "how far
+                apart are these two vectors." Cosine distance (<code>&lt;=&gt;</code>) is the safe default
+                for text — it compares <em>direction</em>, not magnitude, which matches how sentence
+                embeddings work. The others exist for special cases: negative inner product
+                (<code>&lt;#&gt;</code>) is a faster equivalent when vectors are already unit-length, and
+                Euclidean (<code>&lt;-&gt;</code>) is rarely the right choice for text.</span>
+              </div>
+              <div class="row how">
+                <span class="tag">How</span>
+                <span class="txt">The query text is embedded into a vector, then
+                <code>ORDER BY embedding &lt;=&gt; query LIMIT k</code> sorts every row by distance, closest
+                first, and keeps the top k. An optional <code>WHERE</code> clause (built up dynamically
+                from whichever filters were requested — <code>service</code>, a recency window) narrows
+                the search before the sort even happens, using the B-tree indexes from Section 2.</span>
+              </div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>Distance, not similarity, is what gets sorted — 0 means "pointing in exactly the same
+              direction" (identical meaning) and larger numbers mean "further apart in meaning." Sorting
+              ascending by distance puts the closest matches first. The notebook flags a real, easy-to-make
+              bug here: get the sort direction backwards and the query still runs without error — it just
+              silently returns the <em>least</em> relevant chunks first.</p>
+            </div>
+            <table class="cmp">
+              <thead><tr><th>Operator</th><th>Distance type</th><th>Use when</th></tr></thead>
+              <tbody>
+                <tr><td><code>&lt;=&gt;</code></td><td>Cosine</td><td>Text embeddings, normalized or not — the safe default</td></tr>
+                <tr><td><code>&lt;#&gt;</code></td><td>Negative inner product</td><td>Vectors already unit-normalized (fastest)</td></tr>
+                <tr><td><code>&lt;-&gt;</code></td><td>L2 / Euclidean</td><td>Rarely right for text embeddings</td></tr>
+              </tbody>
+            </table>
+            <div class="example-box">
+              <span class="label">Same query, filtered vs. unfiltered</span>
+              <p>Query: <em>"The message bus is falling behind"</em> — even though the query never says
+              "Kafka," a plain vector search over all 5 runbooks ranks the Kafka runbook's chunks highest,
+              because embeddings capture meaning, not keywords. Run the follow-up query <em>"How do I
+              restart it?"</em> with a <code>service='payment-service'</code> filter attached, and the same
+              search engine now only considers payment-service rows — the ambiguous pronoun "it" resolves
+              correctly because the filter did the disambiguation, not the model.</p>
+            </div>
+            <div class="callout tip">
+              <span class="label">Why this beats Notebook 2's approach</span>
+              <p>There, metadata filtering meant hand-slicing numpy arrays and threading candidate-ID lists
+              through the code. Here it's one <code>WHERE</code> clause the query planner optimizes using a
+              real index. Filtering and vector search living in the same engine is the single most
+              practical argument for pgvector.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ SECTION 5 ============ -->
+      <section class="block" id="s5">
+        <div class="cell">
+          <div class="cell-head">
+            <span class="cell-index">§5</span>
+            <span class="cell-title">HNSW: trading a little accuracy for a lot of speed</span>
+          </div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem">
+                <span class="tag">Problem</span>
+                <span class="txt">Every search so far did a <strong>sequential scan</strong> — Postgres
+                compared the query vector against literally every single row before sorting. That's exact,
+                but the cost grows in direct proportion to the number of rows. At 10 runbook chunks that's
+                instant. At millions of chunks across a whole organization's runbooks, it's not.</span>
+              </div>
+              <div class="row why">
+                <span class="tag">Why</span>
+                <span class="txt">A search assistant someone is using mid-incident cannot wait seconds
+                for every query while the database walks the entire table. Production systems need
+                sub-linear search — time that grows much more slowly than the data does.</span>
+              </div>
+              <div class="row what">
+                <span class="tag">What</span>
+                <span class="txt"><strong>HNSW</strong> (Hierarchical Navigable Small World) is an index
+                that pre-builds a layered map of "which vectors are near which other vectors," and walks
+                that map instead of checking every row. Picture a highway system with occasional exits,
+                instead of walking down every single street of every neighborhood to find one house: you
+                take the highway to roughly the right district, then step down to local streets only at
+                the end. It's dramatically faster — but because it's a shortcut, it's
+                <strong>approximate</strong>: it can occasionally miss the one true best match that an
+                exhaustive street-by-street search would have found. That's called <strong>approximate
+                nearest neighbor</strong> search, and the fraction of true matches it still finds is
+                called <strong>recall</strong>.</span>
+              </div>
+              <div class="row how">
+                <span class="tag">How</span>
+                <span class="txt">Three knobs control the trade-off. Two are fixed when the index is
+                built (<code>m</code> — how many highway connections each vector gets; more means better
+                recall but a bigger, slower-to-build index — and <code>ef_construction</code> — how
+                thoroughly the map is built in the first place). The third, <code>ef_search</code>, is a
+                runtime dial: how many candidates the search explores per query. It can be tuned per query
+                with no index rebuild, and it's the one an operator actually adjusts in production.</span>
+              </div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>HNSW is GPS turn-by-turn directions instead of driving down every street in the city.
+              It'll almost always get you to the right house fast — but very occasionally it takes a route
+              that misses the absolute closest one by a house or two. <code>ef_search</code> is "how many
+              alternate routes GPS considers before picking one" — consider more routes, get closer to the
+              true best answer, but the search takes longer.</p>
+            </div>
+            <div class="callout warn">
+              <span class="label">Honest caveat baked into this notebook</span>
+              <p>The real <code>runbook_chunks</code> table only has ~10 rows. HNSW on 10 rows is
+              meaningless — Postgres will often just ignore the index and do a sequential scan anyway,
+              because at that size a full scan is cheaper. That's correct behavior, not a bug. So the
+              actual recall/latency measurement is done separately, against 50,000 synthetic vectors,
+              where the trade-off is big enough to see.</p>
+            </div>
+            <table class="cmp">
+              <thead><tr><th>Parameter</th><th>Set when</th><th>Effect</th></tr></thead>
+              <tbody>
+                <tr><td><code>m</code></td><td>Index build</td><td>Edges per node — higher = better recall, more memory, slower build</td></tr>
+                <tr><td><code>ef_construction</code></td><td>Index build</td><td>Candidate list size while building — higher = better graph, slower build</td></tr>
+                <tr><td><code>ef_search</code></td><td><strong>Every query</strong></td><td>Candidates explored per search — higher = better recall, slower query</td></tr>
+              </tbody>
+            </table>
+            <div class="example-box">
+              <span class="label">The measured recall/latency sweep (50,000 clustered vectors, 384 dimensions)</span>
+              <p>An exact sequential-scan baseline (recall = 1.0, by definition) is measured first, then
+              <code>ef_search</code> is swept across [10, 20, 40, 80, 160, 320] with the HNSW index forced
+              on, comparing each approximate result set against the exact ground truth for 20 realistic
+              queries.</p>
+              <div class="bars">
+                <div class="bar-row"><span class="label">ef_search = 10</span><div class="track"><div class="fill" style="width:91%"></div></div><span class="val">0.91</span></div>
+                <div class="bar-row"><span class="label">ef_search = 20</span><div class="track"><div class="fill" style="width:99%"></div></div><span class="val">0.99</span></div>
+                <div class="bar-row"><span class="label">ef_search = 40</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="val">1.00</span></div>
+                <div class="bar-row"><span class="label">ef_search = 80</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="val">1.00</span></div>
+                <div class="bar-row"><span class="label">ef_search = 160</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="val">1.00</span></div>
+              </div>
+              <p style="margin-top:10px;">Reading it like a latency/cost curve: recall climbs fast with
+              <code>ef_search</code> and then <strong>plateaus</strong> — past that point you're paying
+              extra query latency for zero extra accuracy. The exact scan is the recall = 1.0 reference
+              point; HNSW's entire value proposition is landing close to it, far faster.</p>
+            </div>
+            <div class="callout danger">
+              <span class="label">The scary part: recall &lt; 1.0 fails silently</span>
+              <p>Recall below 1.0 means the right chunk sometimes just isn't in the candidate set the
+              search engine returns — <strong>no error, no log line, nothing.</strong> The system looks
+              completely healthy. The LLM downstream just answers using whatever chunks it was handed,
+              confidently, from an incomplete set of evidence. Production practice: measure recall on
+              <em>your actual data</em>, and re-measure after the corpus grows — the shape of the graph
+              changes as more vectors are added.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ SECTION 5.2 ============ -->
+      <section class="block" id="s5b">
+        <div class="cell">
+          <div class="cell-head">
+            <span class="cell-index">§5.2</span>
+            <span class="cell-title">The benchmark trap: how the test data itself decided the result</span>
+          </div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem">
+                <span class="tag">Problem</span>
+                <span class="txt">While building the HNSW measurement above, the first attempt used pure
+                random vectors for the synthetic 50,000-row corpus — the obvious, easy choice. It produced
+                a wildly different, and wrong, conclusion.</span>
+              </div>
+              <div class="row why">
+                <span class="tag">Why</span>
+                <span class="txt">Any benchmark — including vendor marketing benchmarks — can be
+                accidentally (or conveniently) rigged by choosing unrealistic test data. This is the
+                single most important methodological lesson in the whole notebook: it isn't enough to run
+                the "right" measurement code, the data you feed it has to resemble reality.</span>
+              </div>
+              <div class="row what">
+                <span class="tag">What</span>
+                <span class="txt">Real sentence embeddings <strong>cluster</strong> — sentences about
+                Kafka land near other sentences about Kafka in the 384-dimensional space. Independent
+                random Gaussian vectors don't cluster at all; in high dimensions, random vectors end up
+                almost equally far from everything (the "curse of dimensionality"). HNSW's whole trick
+                depends on there being real neighborhood structure to navigate — feed it a structureless
+                cloud of random points and the greedy graph walk has nothing to follow.</span>
+              </div>
+              <div class="row how">
+                <span class="tag">How</span>
+                <span class="txt">The notebook regenerates the synthetic corpus two ways for comparison:
+                (A) pure random Gaussian vectors, and (B) vectors built from 200 topic centroids plus a
+                small amount of noise — mimicking how real embeddings cluster by topic. It even measures
+                peak cosine similarity within each set as a sanity check before running any search at all:
+                random vectors top out around 0.23 similarity (nothing is really close to anything),
+                clustered vectors reach 0.5–0.9 (matching what real sentence embeddings look like).</span>
+              </div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>Testing a highway shortcut system by scattering houses uniformly at random across an
+              infinite desert, with no towns or neighborhoods, tells you nothing about how it performs on
+              an actual city with real neighborhoods. The shortcuts only help when there's structure to
+              exploit.</p>
+            </div>
+            <div class="example-box">
+              <span class="label">Same index, same code, same hardware — opposite conclusion</span>
+              <table class="cmp">
+                <thead><tr><th>ef_search</th><th>recall@10 (random vectors)</th><th>recall@10 (clustered / realistic vectors)</th></tr></thead>
+                <tbody>
+                  <tr><td>10</td><td>0.025</td><td>0.91</td></tr>
+                  <tr><td>20</td><td>0.065</td><td>0.99</td></tr>
+                  <tr><td>40</td><td>0.085</td><td>1.00</td></tr>
+                  <tr><td>80</td><td>0.155</td><td>1.00</td></tr>
+                  <tr><td>160</td><td>0.300</td><td>1.00</td></tr>
+                </tbody>
+              </table>
+              <div class="bars">
+                <div class="bar-row"><span class="label">random, ef=160</span><div class="track"><div class="fill" style="width:30%;background:linear-gradient(90deg,var(--accent-4),var(--accent-3));"></div></div><span class="val">0.30</span></div>
+                <div class="bar-row"><span class="label">clustered, ef=160</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="val">1.00</span></div>
+              </div>
+            </div>
+            <div class="callout danger">
+              <span class="label">The transferable lesson</span>
+              <p>A benchmark on unrealistic data doesn't produce a slightly-wrong answer — it produces a
+              <strong>confidently inverted one</strong>. A reader who ran only the random-vector version
+              would reasonably (and wrongly) conclude HNSW is unusable and abandon it. Before trusting any
+              approximate-search benchmark, check whether the test vectors actually have the clustering
+              properties of the real corpus. When this gets tuned for a real system later, the sweep has to
+              run against embeddings of the real documents — never synthetic stand-ins.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ SECTION 6 ============ -->
+      <section class="block" id="s6">
+        <div class="cell">
+          <div class="cell-head">
+            <span class="cell-index">§6</span>
+            <span class="cell-title">Hybrid search as one SQL query, not two systems</span>
+          </div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem">
+                <span class="tag">Problem</span>
+                <span class="txt">Notebook 2 ran keyword search (BM25) in a separate Python process from
+                vector search, then fused the two rankings together in numpy. Two systems means two places
+                for bugs to creep in, and two things that can silently drift out of sync as the corpus
+                changes.</span>
+              </div>
+              <div class="row why">
+                <span class="tag">Why</span>
+                <span class="txt">Postgres already has native full-text search built on the GIN index
+                created back in Section 2. If both keyword ranking and vector ranking can run in the same
+                database, the fusion logic can live there too — one query, one system of record.</span>
+              </div>
+              <div class="row what">
+                <span class="tag">What</span>
+                <span class="txt">The query is built from <strong>CTEs</strong> (Common Table
+                Expressions) — think of a CTE as a labeled intermediate step in a recipe: "first, do this
+                and call the result <em>Step A</em>; then do that and call it <em>Step B</em>; now combine
+                A and B." Each CTE here computes one retriever's ranking (one for vector similarity, one
+                for keyword relevance), and a final step combines them. The combination method is
+                <strong>Reciprocal Rank Fusion (RRF)</strong>: instead of trying to average two scores that
+                live on completely different, incomparable scales (a cosine distance and a keyword-rank
+                score), RRF only looks at each retriever's <em>rank</em> — 1st place, 2nd place, 3rd place —
+                and rewards items that rank well on either or both lists.</span>
+              </div>
+              <div class="row how">
+                <span class="tag">How</span>
+                <span class="txt">One CTE ranks chunks by vector distance using
+                <code>ROW_NUMBER() OVER (ORDER BY ...)</code> — a <strong>window function</strong>, which
+                just means "compute a rank for each row without collapsing the table into a single summary
+                number." A second CTE does the same using Postgres's keyword relevance function
+                (<code>ts_rank</code>) over the full-text index. The two rank lists are then combined with
+                a <code>FULL OUTER JOIN</code> (keep a chunk even if only one retriever found it) and
+                scored as <code>1/(60 + rank)</code> summed across both lists — the standard RRF formula,
+                where 60 is a smoothing constant. Sort by that combined score, and the top results are
+                returned.</span>
+              </div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>Imagine two judges scoring a talent show independently — one only cares about vocal
+              technique, the other only cares about audience reaction. Instead of trying to average
+              "8.2 out of a weird technical scale" with "94% audience approval" (numbers that mean nothing
+              compared to each other), RRF just asks each judge for their ranked list — 1st place, 2nd,
+              3rd — and combines the rankings. A contestant who's #1 on one judge's list and #4 on the
+              other's beats someone who's #2 on both, roughly, but the exact math rewards strong rank
+              on either list heavily.</p>
+            </div>
+            <div class="diagram">
+              <div class="flow">
+                <div class="flow-step accent">Vector CTE<span class="sub">rank by embedding distance</span></div>
+                <span class="flow-arrow">+</span>
+                <div class="flow-step purple">Keyword CTE<span class="sub">rank by ts_rank</span></div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step teal">FULL OUTER JOIN<span class="sub">keep either retriever's picks</span></div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step">RRF score<span class="sub">1/(60+rank), summed</span></div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step orange">Top-k results</div>
+              </div>
+            </div>
+            <div class="example-box">
+              <span class="label">Two queries, two different winners</span>
+              <p>Query <em>"NotEnoughReplicasException"</em> — an exact log identifier. Keyword search
+              nails it immediately; vector search is vaguer about an obscure token like this. Query
+              <em>"The message bus is falling behind"</em> — a paraphrase with no shared words with the
+              Kafka runbook text. Vector search wins here; keyword search may not even return the chunk.
+              RRF blends both without either retriever dominating by default — a chunk that only one
+              retriever found (a <code>NULL</code> on the other rank column) can still surface if its
+              single ranking is strong enough.</p>
+            </div>
+            <div class="callout tip">
+              <span class="label">Why rank fusion instead of blending raw scores</span>
+              <p><code>ts_rank</code> and cosine similarity live on completely different, non-comparable
+              scales, and <code>ts_rank</code>'s values shift as the corpus grows (it's influenced by term
+              frequency across the whole table). Rank-based fusion is immune to both problems, which is
+              why it's the default choice in production hybrid-search systems — one less thing to
+              re-tune every time the corpus changes.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ SECTION 7 ============ -->
+      <section class="block" id="s7">
+        <div class="cell">
+          <div class="cell-head">
+            <span class="cell-index">§7</span>
+            <span class="cell-title">Grading retrieval quality with real metrics, not a gut feeling</span>
+          </div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem">
+                <span class="tag">Problem</span>
+                <span class="txt">Earlier notebooks used a single crude metric, <code>hit@1</code>: was
+                the very top result correct, yes or no? That only answers one narrow question and throws
+                away everything about how the rest of the ranked list looked.</span>
+              </div>
+              <div class="row why">
+                <span class="tag">Why</span>
+                <span class="txt">Different failure modes matter for different reasons. A wrong chunk
+                mixed into the prompt can cause the LLM to hallucinate a remediation step — and
+                remediation steps get <em>executed</em> during a live incident. A missed piece of evidence
+                is also bad, just differently bad. One number can't capture both.</span>
+              </div>
+              <div class="row what">
+                <span class="tag">What</span>
+                <span class="txt">Four standard information-retrieval metrics, each answering a different
+                question: <strong>Precision@k</strong> — of the k results actually returned, what fraction
+                were relevant? (catches "prompt pollution," irrelevant junk crowding the context).
+                <strong>Recall@k</strong> — of everything relevant that exists, what fraction did the
+                search find? (catches missed evidence). <strong>MRR</strong> (Mean Reciprocal Rank) — how
+                far down the list was the first relevant result? (does the user see something useful
+                immediately, or have to scroll). <strong>nDCG@k</strong> (Normalized Discounted Cumulative
+                Gain) — are the relevant results bunched near the top, position-weighted? (an overall
+                ranking-quality score from 0 to 1, where 1.0 is a perfect ordering).</span>
+              </div>
+              <div class="row how">
+                <span class="tag">How</span>
+                <span class="txt">Each metric is implemented from scratch in a few lines of arithmetic
+                over a list of 0/1 relevance labels (1 = this ranked result is actually relevant).
+                Precision is just the fraction of 1s in the top k. Recall divides the 1s found by the true
+                total number of relevant chunks in the corpus. MRR finds the position of the first 1 and
+                takes its reciprocal (rank 1 → score 1.0, rank 2 → 0.5, rank 10 → 0.1 — a steep penalty for
+                burying the good result). nDCG discounts each relevant result by
+                <code>log2(rank + 1)</code> — a hit at position 1 counts fully, a hit at position 10 counts
+                much less — then normalizes against the best possible ordering so scores are comparable
+                across different questions.</span>
+              </div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>Precision is "how much of what I handed you was actually useful." Recall is "of all the
+              useful stuff that existed, how much did I actually find." MRR is "how long did you have to
+              scroll before seeing something good." nDCG is a single overall report card that rewards good
+              stuff being near the top and penalizes it being buried.</p>
+            </div>
+            <table class="cmp">
+              <thead><tr><th>Metric</th><th>Question it answers</th><th>Catches</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Precision@k</strong></td><td>Of the k I returned, what fraction were relevant?</td><td>Prompt pollution</td></tr>
+                <tr><td><strong>Recall@k</strong></td><td>Of all relevant chunks, what fraction did I find?</td><td>Missed evidence</td></tr>
+                <tr><td><strong>MRR</strong></td><td>How high was the first relevant result?</td><td>Does the user see it immediately</td></tr>
+                <tr><td><strong>nDCG@k</strong></td><td>Are relevant results ranked near the top?</td><td>Overall ranking quality</td></tr>
+              </tbody>
+            </table>
+            <div class="example-box">
+              <span class="label">Sanity-checking the formulas before trusting them</span>
+              <p>The notebook runs each metric against hand-built toy examples before using them for
+              anything real — never trust a metric you haven't tested. A ranking with all 3 relevant
+              results first scores nDCG@3 = 1.000 (perfect). The same 3 relevant results pushed to
+              dead last score nDCG@3 = 0.000 (worst possible). A mixed case with the first relevant result
+              at position 2 scores MRR = 0.500 (matches <code>1/2</code> exactly, as expected).</p>
+            </div>
+            <div class="callout tip">
+              <span class="label">Which metric matters most for an SRE runbook assistant</span>
+              <p>Mostly precision. Only 3 chunks typically fit in the prompt, so a wrong chunk squeezed
+              into that small budget is a real cost — an invitation for the LLM to hallucinate a step that
+              might get executed live. Recall still matters (missing the one right runbook is bad too),
+              but for a small, fixed context window, precision is usually the tighter constraint.</p>
+            </div>
+            <div class="example-box">
+              <span class="label">A labelled evaluation set — 13 real questions, three categories</span>
+              <p>Ground truth here is document-level: any chunk from the expected runbook counts as
+              relevant (cheaper to label than marking individual chunks, a real trade-off the notebook
+              names explicitly). Questions are split into three categories to see where each retriever
+              actually earns its keep: <strong>lexical</strong> (shares words with the runbook, e.g. "Why
+              is Kafka consumer lag increasing?"), <strong>semantic</strong> (a paraphrase with no shared
+              vocabulary, e.g. "The event pipeline stopped delivering data" for the same Kafka runbook),
+              and <strong>identifier</strong> (an exact code or error string, e.g.
+              "NotEnoughReplicasException in producer logs"). The vector-only retriever and the hybrid
+              (RRF) retriever from Section 6 are scored side by side on identical questions using every
+              metric above, then broken down by category — the pattern that emerges echoes Notebook 2's
+              finding: vector search alone is strong on semantic paraphrases but weaker on exact
+              identifiers, and hybrid closes that gap without giving up the semantic strength.</p>
+            </div>
+            <div class="callout warn">
+              <span class="label">Sample-size honesty</span>
+              <p>13 questions over roughly 10 chunks is a small evaluation set — a single question
+              flipping from wrong to right moves the mean score by roughly 0.08. Treat these particular
+              numbers as an illustration of the <em>method</em>, not a definitive scoreboard. The
+              transferable practice: label a real set, break results down by failure category, and always
+              compare retrievers on identical questions. For a real deployment, harvest evaluation
+              questions from actual incident conversations — that's the only way the question distribution
+              matches what production traffic will actually look like.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ SECTION 8 ============ -->
+      <section class="block" id="s8">
+        <div class="cell">
+          <div class="cell-head">
+            <span class="cell-index">§8</span>
+            <span class="cell-title">Observability: catching failures that look like success</span>
+          </div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem">
+                <span class="tag">Problem</span>
+                <span class="txt">A bad retrieval doesn't crash. It doesn't throw an error. It just quietly
+                hands the LLM the wrong evidence, and the LLM still writes a fluent, confident-sounding
+                answer. Every other service already gets instrumented (logs, metrics, alarms) — retrieval,
+                which fails silently by nature, needs it even more.</span>
+              </div>
+              <div class="row why">
+                <span class="tag">Why</span>
+                <span class="txt">When an engineer later says "the assistant gave me a wrong remediation
+                step," the first question a postmortem needs answered is: was retrieval wrong, or was the
+                LLM wrong given genuinely correct context? Without a record of exactly what was retrieved,
+                for exactly which query, at exactly what time, that question is unanswerable — and the
+                postmortem wastes time arguing about it instead of fixing it.</span>
+              </div>
+              <div class="row what">
+                <span class="tag">What</span>
+                <span class="txt">Four signals worth emitting on every single query: <strong>latency
+                percentiles</strong> per stage (embed, search, re-rank) — not just the average, because
+                averages hide the tail; a <strong>top relevance score</strong> per query (the drift
+                alarm carried over from Notebook 2); the <strong>result count after thresholding</strong>
+                (a rise in zero-result queries signals the corpus and real traffic have diverged); and a
+                <strong>structured query log</strong> recording exactly what was retrieved for exactly
+                which question, so a bad answer can be replayed and diagnosed later.</span>
+              </div>
+              <div class="row how">
+                <span class="tag">How</span>
+                <span class="txt">An <code>instrumented_search()</code> wrapper times each stage
+                separately with a precise clock, runs the hybrid search from Section 6, and appends one
+                structured record per query — timestamp, question, filter used, result count, top score,
+                per-stage timing in milliseconds, which embedding model produced the vectors, and whether
+                the query came back empty ("refused"). That record is exactly the JSON line that would
+                ship to a real log aggregator in production.</span>
+              </div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>A structured log line is a receipt for every search: what was asked, what came back, how
+              confident it was, how long each part took. Without receipts, "something went wrong" is
+              unfalsifiable — nobody can go back and check.</p>
+            </div>
+            <div class="example-box">
+              <span class="label">p95 latency, in plain terms</span>
+              <p><strong>p95 latency</strong> is the time it takes for 95 out of 100 requests to finish —
+              the slowest 5% still matter, because that slow tail is somebody's bad day, often exactly
+              during the worst possible moment (an incident, high traffic). The notebook simulates a
+              realistic traffic mix (the 13 evaluation questions repeated, plus genuinely out-of-scope
+              questions like "How do I bake sourdough bread?") and computes p50/p95/p99 latency alongside
+              the plain average — the whole point being that the average alone would hide exactly the tail
+              that matters operationally.</p>
+            </div>
+            <div class="example-box">
+              <span class="label">The production alarm: in-scope vs. out-of-scope score separation</span>
+              <p>The simulated traffic deliberately mixes real SRE questions with clearly out-of-scope ones
+              (TLS certificate rotation on a mail server, refund policy, sourdough bread). Plotting the
+              top relevance score for in-scope questions against out-of-scope questions answers a very
+              practical question: <strong>if the two distributions separate cleanly, a single fixed
+              confidence threshold can reliably say "I don't know this."</strong> If they overlap, no
+              constant threshold can tell them apart — which is exactly the finding that justifies building
+              a dedicated confidence-scoring component rather than trusting one hardcoded number forever.</p>
+            </div>
+            <div class="diagram">
+              <div class="flow">
+                <div class="flow-step">Query arrives</div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step accent">Time each stage<span class="sub">embed / search</span></div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step teal">Record structured log line<span class="sub">score, timing, model, refused?</span></div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step purple">Aggregate: p50/p95/p99, score histograms</div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step orange">Alarm if thresholds crossed</div>
+              </div>
+            </div>
+            <table class="cmp">
+              <thead><tr><th>Signal</th><th>Alert condition</th><th>What it means</th></tr></thead>
+              <tbody>
+                <tr><td>p95 retrieval latency</td><td>Exceeds SLO for 5 minutes</td><td>Index bloat, missing index, or database contention</td></tr>
+                <tr><td>Zero-result rate</td><td>Rises sharply</td><td>Corpus and real traffic have diverged</td></tr>
+                <tr><td>Mean top relevance score</td><td>Drifts down week over week</td><td>New questions the runbooks don't cover yet</td></tr>
+                <tr><td>Distinct <code>embedding_model</code> values</td><td>More than one</td><td><strong>A partial re-index in progress — the mismatched-model bug, caught automatically</strong></td></tr>
+              </tbody>
+            </table>
+            <div class="callout win">
+              <span class="label">Why the last alert row matters</span>
+              <p>Because every row was stamped with the model that produced it back in Section 2, a
+              one-line query (<code>GROUP BY embedding_model</code>) automatically detects the exact
+              failure Notebook 1's quiz warned about — vectors from two different models mixed in the same
+              search space, which produces no error and just quietly garbage results. If the query returns
+              more than one distinct model, that's an automatic alarm, not a mystery to debug later.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ SECTION 9 ============ -->
+      <section class="block" id="s9">
+        <div class="cell">
+          <div class="cell-head">
+            <span class="cell-index">§9</span>
+            <span class="cell-title">Wiring it all into one production retrieval function</span>
+          </div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem">
+                <span class="tag">Problem</span>
+                <span class="txt">All the pieces built across three notebooks — filtering, hybrid search,
+                re-ranking, quality thresholding, logging — need to become one clean function an agent can
+                simply call, rather than a notebook full of loose cells.</span>
+              </div>
+              <div class="row why">
+                <span class="tag">Why</span>
+                <span class="txt">This is the shape a future agent framework (LangGraph, in Notebook 4)
+                will actually call as a tool. It needs a predictable interface: give it a question, get
+                back results and a log record, every time.</span>
+              </div>
+              <div class="row what">
+                <span class="tag">What</span>
+                <span class="txt">A single pipeline: <strong>filter</strong> by metadata if requested →
+                <strong>hybrid retrieve</strong> a wider candidate pool via the RRF query from Section 6 →
+                <strong>re-rank</strong> that pool with the cross-encoder from Notebook 2 for a more
+                careful final ordering → <strong>threshold</strong> out anything below a minimum confidence
+                score → <strong>log</strong> a structured record of what happened.</span>
+              </div>
+              <div class="row how">
+                <span class="tag">How</span>
+                <span class="txt"><code>retrieve()</code> runs hybrid search for a larger candidate set
+                than the final answer needs, times the retrieve and re-rank stages separately, re-scores
+                candidates with the cross-encoder, sorts by that final score, keeps only the top k above
+                any minimum score, and returns both the results and a log record in one call. A thin
+                <code>answer()</code> wrapper on top builds the final prompt for an LLM, citing chunk IDs,
+                and explicitly instructs it to say "I don't have a runbook for that" rather than
+                guessing when nothing qualifies.</span>
+              </div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>This is the "put it all on one assembly line" step. Instead of a person manually running
+              five separate notebook cells for every question, one function call does filter → search →
+              re-rank → confidence check → log, and hands back a clean answer plus a receipt.</p>
+            </div>
+            <div class="diagram">
+              <div class="flow">
+                <div class="flow-step">Filter<span class="sub">optional metadata</span></div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step accent">Hybrid retrieve<span class="sub">RRF, wide candidate pool</span></div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step purple">Re-rank<span class="sub">cross-encoder</span></div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step orange">Threshold<span class="sub">drop low-confidence</span></div>
+                <span class="flow-arrow">→</span>
+                <div class="flow-step teal">Log<span class="sub">structured record</span></div>
+              </div>
+            </div>
+            <div class="example-box">
+              <span class="label">Three test questions through the finished pipeline</span>
+              <p>A semantic paraphrase ("The message bus is falling behind") returns Kafka runbook chunks
+              with a solid top score. A filtered follow-up ("How do I restart it?" with
+              <code>service="payment-service"</code>) resolves correctly because the filter narrows the
+              search space. An out-of-scope question ("How do I bake sourdough bread?") comes back with
+              <code>NO RESULTS</code> — the pipeline correctly refuses rather than forcing an irrelevant
+              chunk into the answer.</p>
+            </div>
+            <div class="callout win">
+              <span class="label">Why returning a log record matters, not just results</span>
+              <p><code>retrieve()</code> deliberately returns results <em>and</em> a log record together.
+              That shape is intentional: a future agent framework can write the log record straight into
+              its own trace of what happened, so every retrieval decision is auditable. During a
+              postmortem, that's the difference between "the AI was wrong" (unfalsifiable) and "retrieval
+              returned the wrong chunk at a specific time with a specific score, here's the evidence"
+              (fixable).</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ RECAP ============ -->
+      <section class="block" id="recap">
+        <div class="cell">
+          <div class="cell-head">
+            <span class="cell-index">✓</span>
+            <span class="cell-title">What you built</span>
+          </div>
+          <div class="cell-body">
+            <p>Across these three notebooks: a from-scratch keyword search that revealed why matching
+            exact words isn't enough, an embeddings-and-re-ranking pipeline that understood meaning and
+            fused it with keyword search, and now — a durable, filterable, observable retrieval
+            <strong>service</strong> instead of a script.</p>
+            <table class="cmp">
+              <thead><tr><th>What changed</th><th>From</th><th>To</th></tr></thead>
+              <tbody>
+                <tr><td>Storage</td><td>In-memory Python list / FAISS index</td><td>PostgreSQL + pgvector — durable, transactional, filterable</td></tr>
+                <tr><td>Search index</td><td>Exact brute-force scan</td><td>HNSW approximate search, with the recall it costs <em>measured</em>, not assumed</td></tr>
+                <tr><td>Hybrid search</td><td>Two systems (Python BM25 + numpy fusion)</td><td>One SQL query, fused with Reciprocal Rank Fusion</td></tr>
+                <tr><td>Quality measurement</td><td><code>hit@1</code> on 10 questions</td><td>Precision@k, Recall@k, MRR, nDCG@k — implemented and sanity-checked from scratch</td></tr>
+                <tr><td>Operations</td><td>None</td><td>Latency percentiles, structured query logs, score-drift alarms</td></tr>
+              </tbody>
+            </table>
+            <div class="pwwh">
+              <div class="row why">
+                <span class="tag">Takeaway</span>
+                <span class="txt">The recurring theme across all three notebooks: every naive-looking
+                shortcut (exact keyword matching, an in-memory index, a single crude hit@1 metric, no
+                instrumentation) works fine on a small demo and breaks in a specific, predictable way at
+                real scale — usually silently. Production RAG isn't a different algorithm; it's the same
+                retrieval idea wrapped in durability, measurement, and instrumentation so those failures
+                become visible instead of invisible.</span>
+              </div>
+            </div>
+            <div class="callout tip">
+              <span class="label">What's next</span>
+              <p>Notebook 4 turns this <code>retrieve()</code> function into a tool an AI agent decides to
+              call, adds multi-step reasoning over a whole incident's worth of context, memory across
+              investigations, and a human-in-the-loop approval step — where these three notebooks converge
+              with an actual agent framework.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <div class="pagenav">
+        <a href="notebook2.html">
+          <div class="dir">← Previous</div>
+          <div class="name">Notebook 2 — Embeddings, FAISS &amp; Hybrid Search</div>
+        </a>
+        <a href="index.html#concepts" class="next">
+          <div class="dir">Next</div>
+          <div class="name">Back to Concepts →</div>
+        </a>
+      </div>
+
+    </main>
+  </div>
+</div>
+
+<footer class="site">
+  RAG From Scratch → Production — a 3-notebook series on building a search assistant, from TF-IDF to a production-grade retrieval service.
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,35 @@
+# SRE Copilot — pgvector for the RAG track (Notebook 3) and Milestone 13.
+# Usage:
+#   docker compose up -d
+#   docker compose exec pgvector psql -U postgres -d srecopilot -c "CREATE EXTENSION IF NOT EXISTS vector;"
+services:
+  pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: sre-pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: srecopilot
+    ports:
+      - "5432:5432"
+    volumes:
+      # Named volume: survives `docker compose down`, so you don't re-embed the
+      # corpus on every restart. Removing it requires `docker compose down -v`.
+      - pgdata:/var/lib/postgresql/data
+      # Anything in this dir runs ONCE on first init of an empty volume.
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d srecopilot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # 29GB box: give Postgres room for HNSW index builds, which are memory-hungry.
+    command: >
+      postgres
+      -c shared_buffers=2GB
+      -c maintenance_work_mem=2GB
+      -c max_parallel_maintenance_workers=4
+
+volumes:
+  pgdata:

@@ -1,0 +1,538 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Notebook 2 — Modern Semantic RAG</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="dot"></span> RAG From Scratch → Production</a>
+    <nav class="topnav">
+      <a href="index.html#notebooks">Notebooks</a>
+      <a href="index.html#concepts">Concepts</a>
+      <a href="notebook1.html">Notebook 1</a>
+      <a href="notebook3.html">Notebook 3</a>
+    </nav>
+  </div>
+</div>
+
+<div class="page">
+
+  <section class="hero">
+    <span class="eyebrow">Notebook 2 of 3</span>
+    <h1>Modern Semantic RAG — teaching the search engine what words <em>mean</em></h1>
+    <p class="lede">
+      Notebook 1 built a search engine that only matches exact words, and it flat-out failed on
+      real on-call language — a query like "the message bus is falling behind" scored a flat
+      <strong>0.000</strong> against the Kafka runbook because the two share zero words. This notebook
+      rebuilds retrieval around <strong>meaning</strong> instead of spelling: embeddings that understand
+      synonyms, a fast index to search them at scale, a second-pass re-ranker that fixes the mistakes
+      the first pass makes, a hybrid search that gets exact error codes back, and metadata filters that
+      stop the system from searching the wrong runbooks entirely.
+    </p>
+    <div class="hero-meta">
+      <span class="pill accent">Sentence-transformer embeddings</span>
+      <span class="pill teal">FAISS vector index</span>
+      <span class="pill purple">Cross-encoder re-ranking</span>
+      <span class="pill orange">BM25 hybrid search</span>
+      <span class="pill">Metadata filtering</span>
+      <span class="pill">Relevance thresholding</span>
+    </div>
+  </section>
+
+  <div class="section-nav-jump">
+    <a href="#s0">0. Setup</a>
+    <a href="#s1">1. Rebuild</a>
+    <a href="#s2">2. Baseline</a>
+    <a href="#s3">3. Embeddings</a>
+    <a href="#s4">4. FAISS</a>
+    <a href="#s5">5. Re-ranking</a>
+    <a href="#s6">6. Hybrid</a>
+    <a href="#s7">7. Filtering</a>
+    <a href="#s8">8. Full pipeline</a>
+    <a href="#s9">9. Scoreboard</a>
+    <a href="#recap">Recap</a>
+  </div>
+
+  <div class="layout-2col">
+    <aside class="toc">
+      <div class="toc-title">On this page</div>
+      <a href="#s0">0 — Setup</a>
+      <a href="#s1">1 — Same corpus, same rules</a>
+      <a href="#s2">2 — Baseline replay</a>
+      <a href="#s3">3 — Sentence embeddings</a>
+      <a href="#s3-2">3.1/3.2 — The synonym test</a>
+      <a href="#s4">4 — FAISS index</a>
+      <a href="#s5">5 — Cross-encoder re-ranking</a>
+      <a href="#s5-2">5.1 — Cost of re-ranking</a>
+      <a href="#s6">6 — Hybrid BM25 + vector</a>
+      <a href="#s6-2">6.1 — Tuning alpha</a>
+      <a href="#s7">7 — Metadata filtering</a>
+      <a href="#s8">8 — Full pipeline</a>
+      <a href="#s8-1">8.1 — The hallucination trap</a>
+      <a href="#s9">9 — Final scoreboard</a>
+      <a href="#recap">What you built</a>
+    </aside>
+
+    <main>
+
+      <!-- SECTION 0 -->
+      <section class="block" id="s0">
+        <h2>Section 0 — Setting up the new toolkit</h2>
+        <p class="section-sub">Cell 1–3 · installing the libraries this notebook needs</p>
+        <div class="cell">
+          <div class="cell-head"><span class="cell-index">0</span><span class="cell-title">New tools: sentence-transformers, FAISS, BM25</span></div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem"><div class="tag">Problem</div><div class="txt">Notebook 1's toolkit (TF-IDF, a plain Python list, a for-loop) can only compare <strong>spelling</strong>, not meaning. We need new tools before we can fix that.</div></div>
+              <div class="row why"><div class="tag">Why</div><div class="txt">Every later section in this notebook depends on three new libraries. Installing them up front (rather than mid-notebook) keeps the rest of the walkthrough about ideas, not package management.</div></div>
+              <div class="row what"><div class="tag">What</div><div class="txt">Three new pieces: <strong>sentence-transformers</strong> (turns text into "meaning vectors"), <strong>faiss-cpu</strong> (a fast lookup system for those vectors, built by Meta), and <strong>rank_bm25</strong> (a smarter keyword scorer than TF-IDF).</div></div>
+              <div class="row how"><div class="tag">How</div><div class="txt">One install cell pulls in all three libraries, plus the two models we'll download and cache: a small "embedding" model and a small "re-ranking" model — about 120&nbsp;MB combined.</div></div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>Think of this as swapping a highlighter (which can only spot words you already typed) for a translator who understands what you <em>mean</em>, plus a filing system fast enough to search millions of documents.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 1 -->
+      <section class="block" id="s1">
+        <h2>Section 1 — Rebuilding the exact same corpus</h2>
+        <p class="section-sub">Cell 5–7 · same five runbooks, same chunking, same test questions as Notebook 1</p>
+        <div class="cell">
+          <div class="cell-head"><span class="cell-index">1</span><span class="cell-title">Keep everything identical except the one thing being tested</span></div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem"><div class="tag">Problem</div><div class="txt">If we change the runbooks, the chunking, <em>and</em> the search method all at once, and results improve, we won't know which change actually helped.</div></div>
+              <div class="row why"><div class="tag">Why</div><div class="txt">This is basic experimental hygiene — change one variable at a time. Otherwise any improvement is a coincidence you can't explain or reproduce.</div></div>
+              <div class="row what"><div class="tag">What</div><div class="txt">The same five SRE runbooks (payment, orders, login, Kafka, Kubernetes) are cleaned and cut into the same 60-word overlapping chunks as Notebook 1. The same 10 test questions come back too — 5 "lexical" ones that share words with the runbook, 5 "semantic" ones that are paraphrases with almost no shared words.</div></div>
+              <div class="row how"><div class="tag">How</div><div class="txt">The cleaning function and the chunking function are copy-pasted unchanged from Notebook 1. Only the next section — how a chunk gets turned into numbers — is allowed to change.</div></div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>It's like re-running the same cooking test with the same ingredients and the same oven, changing only the recipe technique you're trying to evaluate.</p>
+            </div>
+            <div class="example-box">
+              <span class="label">The test set that exposes everything</span>
+              <p>5 "lexical" questions like <em>"Why is Kafka consumer lag increasing?"</em> share real words with the Kafka runbook. 5 "semantic" questions like <em>"The message bus is falling behind"</em> mean the same thing but share almost none. This split is the single most useful idea in the whole notebook — it tells you exactly <strong>which half</strong> of the problem a change actually fixed.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 2 -->
+      <section class="block" id="s2">
+        <h2>Section 2 — Replaying the old baseline</h2>
+        <p class="section-sub">Cell 9 · re-running TF-IDF so the "before" numbers are measured here too</p>
+        <div class="cell">
+          <div class="cell-head"><span class="cell-index">2</span><span class="cell-title">Re-run TF-IDF to get an honest "before" score</span></div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem"><div class="tag">Problem</div><div class="txt">We need a documented "before" number, in this same notebook, to point at and say: "this is what we're improving on."</div></div>
+              <div class="row why"><div class="tag">Why</div><div class="txt">Asserting an improvement without measuring the baseline in the same run invites doubt — did anything else change under the hood?</div></div>
+              <div class="row what"><div class="tag">What</div><div class="txt">TF-IDF scores every chunk by counting shared words with the query, weighted so rare distinctive words (like "Kafka") count more than common ones (like "the").</div></div>
+              <div class="row how"><div class="tag">How</div><div class="txt">The exact same TF-IDF setup from Notebook 1 is rebuilt here, and a reusable <code>evaluate()</code> function is written once — it just needs a scoring function and reports hit-rate overall, and separately for lexical vs. semantic questions. Every later retriever in this notebook plugs into this same evaluator.</div></div>
+            </div>
+            <div class="example-box">
+              <span class="label">The baseline, restated</span>
+              <p>TF-IDF gets the 5 lexical questions right and misses all 5 semantic ones — overall hit-rate around 50%, exactly matching Notebook 1's finding.</p>
+            </div>
+            <div class="callout tip">
+              <span class="label">Tip</span>
+              <p>Watch the "by kind" breakdown, not just the overall score, for every retriever from here on — it's what tells you <em>which</em> problem got fixed.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 3 -->
+      <section class="block" id="s3">
+        <h2>Section 3 — Sentence embeddings: teaching the machine what words mean</h2>
+        <p class="section-sub">Cell 11 · swapping "count the words" for "understand the sentence"</p>
+        <div class="cell">
+          <div class="cell-head"><span class="cell-index">3</span><span class="cell-title">all-MiniLM-L6-v2: turning a sentence into a point in space</span></div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem"><div class="tag">Problem</div><div class="txt">TF-IDF has no concept of synonyms. "Message bus" and "Kafka" are two completely different words to it, even though an SRE knows they mean the same thing here.</div></div>
+              <div class="row why"><div class="tag">Why</div><div class="txt">Real people don't repeat a runbook's exact vocabulary when they're paging at 2am. If search only works for people who already know the right words, it isn't useful during an actual incident.</div></div>
+              <div class="row what"><div class="tag">What</div><div class="txt">An <strong>embedding</strong> is a list of numbers — a "GPS coordinate for meaning" — that a trained neural network assigns to a piece of text. Texts with similar meaning land at nearby coordinates, even if they don't share a single word. A <strong>sentence-transformer</strong> is the model that produces these coordinates; "all-MiniLM-L6-v2" is a small, fast one that outputs 384 numbers per chunk.</div></div>
+              <div class="row how"><div class="tag">How</div><div class="txt">Nothing about the surrounding pipeline changes — same chunks, same "compare with cosine similarity" math as Notebook 1. Only the function that turns text into numbers is swapped: instead of counting words, every chunk gets encoded into a 384-number vector by the transformer model. All vectors are also scaled to the same length ("normalized"), which is what lets the next section's fast index treat "closest" and "most similar" as the same question.</div></div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>Imagine giving every sentence in the world a GPS coordinate based on what it <em>means</em>, not what letters it contains. "The message bus is falling behind" and "Kafka consumer lag is increasing" would land right next to each other on that map, even though they don't share a single important word.</p>
+            </div>
+            <div class="diagram">
+              <div class="flow">
+                <div class="flow-step">Chunk text</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step accent">MiniLM model<span class="sub">reads every word in context</span></div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step teal">384 numbers<span class="sub">one fixed-size "meaning coordinate"</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="cell" id="s3-2">
+          <div class="cell-head"><span class="cell-index">3.1–3.2</span><span class="cell-title">The moment of truth: does it fix the 0.000 score?</span></div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem"><div class="tag">Problem</div><div class="txt">Notebook 1's worst failure: <em>"The message bus is falling behind"</em> scored exactly <strong>0.000</strong> against the correct Kafka runbook.</div></div>
+              <div class="row why"><div class="tag">Why</div><div class="txt">This is the single query that most clearly shows the gap between "matching words" and "matching meaning" — it's the best test of whether embeddings actually work.</div></div>
+              <div class="row what"><div class="tag">What</div><div class="txt">Run the exact same query through both TF-IDF and MiniLM and compare which runbook each one picks as the best match.</div></div>
+              <div class="row how"><div class="tag">How</div><div class="txt">The query is encoded into its own 384-number vector, then compared against every chunk's vector — same dot-product math as before, just on the new coordinates. The result is plotted side-by-side, and a full evaluation run reports the new hit-rate split by lexical vs. semantic.</div></div>
+            </div>
+            <div class="example-box">
+              <span class="label">Real notebook numbers</span>
+              <p><strong>Query:</strong> "The message bus is falling behind" (expected: kafka-cluster)</p>
+              <p><strong>TF-IDF best match →</strong> wrong runbook, score <strong>0.000</strong><br>
+              <strong>MiniLM best match →</strong> kafka-cluster, a strongly positive score</p>
+              <p>Across the full 10-question test set, the semantic half — which TF-IDF missed 5-for-5 — now recovers, while the lexical half (which TF-IDF already handled) stays solid. The overall hit-rate jumps well past the 50% ceiling Notebook 1 got stuck at.</p>
+            </div>
+            <div class="diagram">
+              <div class="bars">
+                <div class="bar-row"><div class="label">TF-IDF · "message bus" query</div><div class="track"><div class="fill" style="width:2%"></div></div><div class="val">0.000</div></div>
+                <div class="bar-row"><div class="label">MiniLM · "message bus" query</div><div class="track"><div class="fill" style="width:78%"></div></div><div class="val">high</div></div>
+              </div>
+            </div>
+            <div class="callout win">
+              <span class="label">Win</span>
+              <p>A PCA map of the two vector spaces (§3.2 in the notebook) shows the shift directly: TF-IDF clusters chunks by shared vocabulary, while MiniLM clusters the same chunks by topic — Kafka chunks group together even when worded completely differently.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 4 -->
+      <section class="block" id="s4">
+        <h2>Section 4 — FAISS: a fast filing system for meaning-coordinates</h2>
+        <p class="section-sub">Cell 20 · replacing the for-loop with a purpose-built vector index</p>
+        <div class="cell">
+          <div class="cell-head"><span class="cell-index">4</span><span class="cell-title">Same search, engineered to actually scale</span></div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem"><div class="tag">Problem</div><div class="txt">Notebook 1's search was a Python for-loop comparing the query against every single chunk, one at a time — correct, but it gets painfully slow once you have more than a handful of documents.</div></div>
+              <div class="row why"><div class="tag">Why</div><div class="txt">A real runbook library has thousands of pages, not five. At even 100,000 chunks, a plain for-loop in Python becomes too slow to answer a query in real time.</div></div>
+              <div class="row what"><div class="tag">What</div><div class="txt"><strong>FAISS</strong> is a library (built by Meta) purpose-built to store meaning-coordinates and find the closest ones fast — it's the same core idea a vector database uses under the hood. We use <code>IndexFlatIP</code>: it still checks every stored vector (so the result is mathematically identical to the old for-loop), just implemented in fast compiled code instead of a Python loop.</div></div>
+              <div class="row how"><div class="tag">How</div><div class="txt">All the chunk vectors are loaded into the index once. From then on, a search just asks FAISS for the top few closest vectors, and FAISS hands back their position numbers and scores — which get mapped back to chunk IDs. The notebook double-checks that FAISS's answer for a sample query is identical, row for row, to the old hand-written numpy search.</div></div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>If TF-IDF's for-loop is checking every filing cabinet in a building one by one, FAISS is a librarian who has already organized everything for fast lookup. For small archives it's overkill; for a whole company's runbooks, it's the only way search stays instant.</p>
+            </div>
+            <table class="cmp">
+              <thead><tr><th>Index type</th><th>Search style</th><th>Recall</th><th>Use when</th></tr></thead>
+              <tbody>
+                <tr><td>IndexFlatIP</td><td>exact, checks everything</td><td>100%</td><td>&lt; ~100k vectors</td></tr>
+                <tr><td>IndexHNSWFlat</td><td>approximate graph walk</td><td>~95–99%</td><td>millions of vectors</td></tr>
+              </tbody>
+            </table>
+            <div class="callout warn">
+              <span class="label">Caveat</span>
+              <p>Approximate indexes trade accuracy for speed — they can silently miss the true best match. This notebook's 10 chunks don't need that trade-off, so it uses the exact index. Production systems at scale (like pgvector's HNSW index in Notebook 3) do make this trade, and the recall loss becomes something you have to measure, not assume away.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 5 -->
+      <section class="block" id="s5">
+        <h2>Section 5 — Cross-encoder re-ranking: a second, stricter look</h2>
+        <p class="section-sub">Cell 22–24 · fixing "vocabulary collision" mistakes that embeddings alone still make</p>
+        <div class="cell">
+          <div class="cell-head"><span class="cell-index">5</span><span class="cell-title">Bi-encoder vs. cross-encoder</span></div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem"><div class="tag">Problem</div><div class="txt">Even with good embeddings, one failure survives from Notebook 1: <em>"Customers see failures at checkout"</em> retrieved the Kubernetes runbook instead of payment-service, because the word "failures" is strong there.</div></div>
+              <div class="row why"><div class="tag">Why</div><div class="txt">The embedding model encodes the question and every chunk <strong>separately</strong>, then compares the resulting coordinates. It never actually reads the question and a specific chunk side by side — so subtle wording overlaps can still fool it.</div></div>
+              <div class="row what"><div class="tag">What</div><div class="txt">The model we've used so far (a <strong>bi-encoder</strong>) is like two people separately taking notes on two different documents, then comparing notes afterward — fast, because chunk notes can be prepared ahead of time. A <strong>cross-encoder</strong> instead reads the question and one candidate chunk <em>together, side by side, in the same pass</em> — much more accurate, but it has to be done fresh for every single pair, so it can't be pre-computed and doesn't scale to a whole corpus.</div></div>
+              <div class="row how"><div class="tag">How</div><div class="txt">The standard two-stage pattern used by Google, Bing, and every serious search system: <strong>Stage 1</strong> — cheaply retrieve a wide pool (top-20) using the bi-encoder + FAISS. <strong>Stage 2</strong> — run the slower, more accurate cross-encoder on just those 20 candidates, and keep only the new top 3. You get the speed of the bi-encoder and the accuracy of the cross-encoder, by only paying the cross-encoder's cost on a tiny shortlist.</div></div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>Bi-encoder: two students each summarize a different book, then you compare summaries. Cross-encoder: one student reads both books side by side and gives you a direct verdict. The second is more reliable but far slower if you had to do it for every book in the library — so you use the fast method to find the 20 most promising books, then bring in the careful reader only for those 20.</p>
+            </div>
+            <div class="diagram">
+              <div class="flow">
+                <div class="flow-step">question</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step accent">encoder → vector</div>
+                <div class="flow-arrow">╲</div>
+              </div>
+              <div class="flow" style="margin-top:6px;">
+                <div class="flow-step">chunk</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step accent">encoder → vector</div>
+                <div class="flow-arrow">╱</div>
+                <div class="flow-step teal">cosine score<span class="sub">bi-encoder: texts never meet</span></div>
+              </div>
+              <div class="hr" style="margin:22px 0;"></div>
+              <div class="flow">
+                <div class="flow-step purple">question + chunk, together</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step purple">one shared encoder pass</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-step pink">relevance score<span class="sub">cross-encoder: full attention between both texts</span></div>
+              </div>
+            </div>
+            <div class="example-box">
+              <span class="label">The collision, rescued</span>
+              <p><strong>Query:</strong> "Customers see failures at checkout" (expected: payment-service)</p>
+              <p><strong>Stage 1 (bi-encoder / FAISS):</strong> top result is <em>not</em> payment-service — it's pulled off course by the word "failures."<br>
+              <strong>Stage 2 (after cross-encoder re-ranking):</strong> payment-service is promoted to the top — the cross-encoder reads the question and each candidate chunk together and correctly judges that a checkout failure is a payment problem, not a Kubernetes one.</p>
+              <p>The notebook visualizes this as a "rank shuffle" chart — a line from each chunk's Stage 1 rank to its Stage 2 rank, with the correct runbook's line moving up.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="cell" id="s5-2">
+          <div class="cell-head"><span class="cell-index">5.1</span><span class="cell-title">The bill: how much slower is re-ranking?</span></div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem"><div class="tag">Problem</div><div class="txt">Better accuracy isn't free — re-ranking 20 candidates means 20 extra full model passes on the critical path of every single query.</div></div>
+              <div class="row why"><div class="tag">Why</div><div class="txt">You should never add a component like this without measuring what it costs. "More accurate" and "worth it" are different questions.</div></div>
+              <div class="row what"><div class="tag">What</div><div class="txt">Latency: how long, in milliseconds, a user waits for a result.</div></div>
+              <div class="row how"><div class="tag">How</div><div class="txt">The notebook times the bi-encoder-only search and the full bi-encoder + cross-encoder search over several runs and reports the ratio.</div></div>
+            </div>
+            <div class="callout warn">
+              <span class="label">Trade-off</span>
+              <p>Cross-encoder re-ranking is measured as several times slower than bi-encoder search alone (tens to low-hundreds of milliseconds vs. single-digit milliseconds). The notebook's verdict: during an actual incident, an SRE will happily wait an extra 300ms for a materially better answer — but this is a product decision, not a free upgrade, and it belongs on the latency budget.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 6 -->
+      <section class="block" id="s6">
+        <h2>Section 6 — Hybrid search: BM25 + embeddings together</h2>
+        <p class="section-sub">Cell 28–31 · fixing the new blind spot embeddings introduced</p>
+        <div class="cell">
+          <div class="cell-head"><span class="cell-index">6</span><span class="cell-title">Embeddings are bad at exact identifiers</span></div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem"><div class="tag">Problem</div><div class="txt">Embeddings have their own blind spot — the mirror image of TF-IDF's. Ask for the literal error string <code>NotEnoughReplicasException</code> and MiniLM gives you something merely "similar in topic," not an exact hit.</div></div>
+              <div class="row why"><div class="tag">Why</div><div class="txt">This matters enormously for SRE work. On-call engineers paste exact pod names, exception classes, and topic names — they want that literal token found, not a topically-related paragraph.</div></div>
+              <div class="row what"><div class="tag">What</div><div class="txt"><strong>BM25</strong> is a modernized version of TF-IDF's keyword counting (it accounts for document length and diminishing returns on repeated words) — it's precise on exact strings the way embeddings are precise on meaning. <strong>Hybrid search</strong> runs both a keyword scorer and an embedding scorer and blends their opinions instead of picking one.</div></div>
+              <div class="row how"><div class="tag">How</div><div class="txt">Two ways to combine scores are shown. <strong>Weighted blend:</strong> rescale both scores to 0–1 first (because BM25's scores are unbounded, roughly 0–20+, while cosine scores are bounded −1 to 1 — adding them unscaled would let BM25 dominate arbitrarily), then mix them with a dial called <strong>alpha</strong>: <code>alpha × embedding_score + (1 − alpha) × BM25_score</code>. <strong>Reciprocal Rank Fusion (RRF):</strong> ignore raw scores entirely and fuse by each result's <em>rank position</em> instead — more robust, no rescaling needed.</div></div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>Embeddings are a colleague who's great at grasping the gist of what you mean but bad with exact names and numbers. Keyword search is the opposite — terrible at paraphrases, perfect at exact strings. Hybrid search asks both colleagues and merges their answers.</p>
+            </div>
+            <div class="example-box">
+              <span class="label">Real notebook numbers</span>
+              <p><strong>Query:</strong> "NotEnoughReplicasException" (a literal exception string, expected: kafka-cluster)</p>
+              <p><strong>BM25 best →</strong> kafka-cluster, a strong positive score (it can literally see the matching token)<br>
+              <strong>MiniLM best →</strong> a noticeably weaker match — semantically "in the area" but not zeroed in on the exact string</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="cell" id="s6-2">
+          <div class="cell-head"><span class="cell-index">6.1</span><span class="cell-title">Tuning alpha: watch the two question types pull apart</span></div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem"><div class="tag">Problem</div><div class="txt">What's the "right" mix of keyword vs. embedding scoring? Is there one correct number?</div></div>
+              <div class="row why"><div class="tag">Why</div><div class="txt">Sweeping alpha from 0 (pure BM25) to 1 (pure embeddings) and plotting lexical vs. semantic hit-rate separately reveals the real trade-off, instead of hiding it inside one blended number.</div></div>
+              <div class="row what"><div class="tag">What</div><div class="txt">Alpha is a dial from 0 to 1: 0 means "trust only keyword matching," 1 means "trust only meaning matching," and anything in between is a blend.</div></div>
+              <div class="row how"><div class="tag">How</div><div class="txt">The notebook runs the full 10-question eval at 11 different alpha values and plots lexical hit-rate, semantic hit-rate, and overall hit-rate as three lines against alpha.</div></div>
+            </div>
+            <div class="diagram">
+              <div class="bars">
+                <div class="bar-row"><div class="label">alpha = 0 (pure BM25)</div><div class="track"><div class="fill" style="width:60%"></div></div><div class="val">lexical ↑</div></div>
+                <div class="bar-row"><div class="label">alpha = 0.5 (blend)</div><div class="track"><div class="fill" style="width:75%"></div></div><div class="val">balanced</div></div>
+                <div class="bar-row"><div class="label">alpha = 1 (pure dense)</div><div class="track"><div class="fill" style="width:70%"></div></div><div class="val">semantic ↑</div></div>
+              </div>
+            </div>
+            <div class="callout warn">
+              <span class="label">Read this carefully</span>
+              <p>If the lexical and semantic curves slope in <em>opposite</em> directions as alpha changes, that's the actual trade-off of hybrid search: keyword matching wins on literal queries, embeddings win on paraphrases, and alpha buys one at the expense of the other. <strong>The best alpha is a property of your query mix, not a universal constant</strong> — don't copy someone else's alpha from a blog post. Build an eval set from real on-call questions first.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 7 -->
+      <section class="block" id="s7">
+        <h2>Section 7 — Metadata filtering: don't even look at the wrong runbooks</h2>
+        <p class="section-sub">Cell 34 · using known facts about the incident to narrow the search up front</p>
+        <div class="cell">
+          <div class="cell-head"><span class="cell-index">7</span><span class="cell-title">Pre-filter, don't post-filter</span></div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem"><div class="tag">Problem</div><div class="txt">Every search so far checks <em>all</em> chunks, every time. But during a Kafka incident, searching the login runbook isn't just wasted work — it's a chance to confidently retrieve something plausible-but-wrong.</div></div>
+              <div class="row why"><div class="tag">Why</div><div class="txt">If the incident system already knows the affected service (e.g. from an "Incident Bundle" that says <code>service: kafka-cluster</code>), ignoring that fact and searching everything is throwing away free, reliable information.</div></div>
+              <div class="row what"><div class="tag">What</div><div class="txt"><strong>Pre-filtering</strong> means narrowing the candidate set <em>before</em> searching, so search only ever considers allowed chunks. <strong>Post-filtering</strong> means searching everything first, then throwing away results that don't match — which has a real bug: if all the top results happen to belong to other services, you're left with nothing.</div></div>
+              <div class="row how"><div class="tag">How</div><div class="txt">A true/false mask marks which chunks belong to the allowed service(s); the search only runs over the rows where that mask is true. Real production vector databases do the same thing natively (in pgvector, this is a SQL <code>WHERE</code> clause running alongside the similarity search).</div></div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>Post-filtering is searching the whole building for a red folder, then throwing out anything that's not red — and if the whole floor you searched happens to have no red folders, you come back empty-handed. Pre-filtering is only opening the red filing cabinet in the first place.</p>
+            </div>
+            <div class="example-box">
+              <span class="label">Real notebook example</span>
+              <p><strong>Query:</strong> "How do I restart it?" — deliberately vague, exactly how people talk mid-incident.</p>
+              <p><strong>No filter:</strong> ambiguous — every runbook has some kind of restart procedure, so the top result could be any of the five services.<br>
+              <strong>Pre-filtered to payment-service:</strong> returns payment-service restart steps specifically.<br>
+              <strong>Pre-filtered to kafka-cluster:</strong> returns Kafka broker restart steps specifically.</p>
+              <p>The vague question becomes answerable the moment you supply one known fact.</p>
+            </div>
+            <div class="callout tip">
+              <span class="label">Tip</span>
+              <p>In a production incident system, structured fields like <code>service</code>, <code>severity</code>, and <code>deployment</code> aren't just information for the LLM to read — they're a retrieval filter. Using them cuts both cost (searching fewer chunks) and hallucination risk (never even considering the wrong runbook). Filtering is free accuracy whenever you already have structured context.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 8 -->
+      <section class="block" id="s8">
+        <h2>Section 8 — The full pipeline, assembled</h2>
+        <p class="section-sub">Cell 37–41 · every component wired together in production order, and the trap that's still open</p>
+        <div class="cell">
+          <div class="cell-head"><span class="cell-index">8</span><span class="cell-title">Filter → hybrid retrieve → re-rank → prompt → answer</span></div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem"><div class="tag">Problem</div><div class="txt">Every component built so far — embeddings, FAISS, cross-encoder, hybrid fusion, filtering — has been shown separately. A real system needs them working together, in the right order.</div></div>
+              <div class="row why"><div class="tag">Why</div><div class="txt">The order matters: filtering first narrows the field cheaply; hybrid retrieval next casts a wide, fast net over what's left; re-ranking last spends its expensive accuracy only on a small shortlist. Doing it in a different order wastes work or loses accuracy.</div></div>
+              <div class="row what"><div class="tag">What</div><div class="txt">One function, <code>rag_pipeline()</code>, chains: metadata pre-filter → hybrid (BM25 + embeddings, fused by RRF) retrieval of a wide candidate pool → cross-encoder re-ranking down to the final top-k. A second function, <code>build_prompt()</code>, wraps those results in the same "answer only from this context, cite sources, refuse if you don't know" prompt template as Notebook 1.</div></div>
+              <div class="row how"><div class="tag">How</div><div class="txt">Three test questions each exercise a different path: a paraphrase with no filter, a vague question with a service filter applied, and — critically — a genuinely out-of-scope question about a mail server TLS certificate, which no runbook in this corpus covers.</div></div>
+            </div>
+            <div class="diagram">
+              <div class="flow vertical">
+                <div class="flow-step">question</div>
+                <div class="flow-arrow">↓</div>
+                <div class="flow-step orange">metadata filter<span class="sub">narrow candidates using known incident fields</span></div>
+                <div class="flow-arrow">↓</div>
+                <div class="flow-step accent">Stage 1: retrieve<span class="sub">bi-encoder + FAISS (top-20) ⊕ BM25 (top-20), fused by RRF</span></div>
+                <div class="flow-arrow">↓</div>
+                <div class="flow-step purple">Stage 2: re-rank<span class="sub">cross-encoder over ~20 candidates → top-3</span></div>
+                <div class="flow-arrow">↓</div>
+                <div class="flow-step teal">build prompt<span class="sub">grounded, cited, with a refusal escape hatch</span></div>
+                <div class="flow-arrow">↓</div>
+                <div class="flow-step">LLM answer</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="cell" id="s8-1">
+          <div class="cell-head"><span class="cell-index">8.1</span><span class="cell-title">The trap: top-k search can never say "I don't know"</span></div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem"><div class="tag">Problem</div><div class="txt">The pipeline was asked <em>"How do I rotate the TLS certificate on the mail server?"</em> — there is no mail-server runbook in this corpus at all. The correct answer is "I don't have a runbook for that." Instead, retrieval confidently returned three chunks, and the mock LLM dutifully produced commands from them.</div></div>
+              <div class="row why"><div class="tag">Why</div><div class="txt">This is not the LLM's fault — it did exactly what it was told, using the context it was handed. <strong>The retrieval layer lied first.</strong> "Top-k" literally means "always return k results," and ranking is relative — the system will happily hand you the least-bad chunk out of a corpus of entirely irrelevant chunks. Nothing about a top-k search ever asks "is this actually relevant at all?"</div></div>
+              <div class="row what"><div class="tag">What</div><div class="txt">A <strong>relevance threshold</strong> is an absolute score floor. Retrieve the top-k as usual, then throw out anything scoring below the floor. If nothing survives, return zero context and let the model refuse honestly.</div></div>
+              <div class="row how"><div class="tag">How</div><div class="txt">The notebook prints the top relevance score for six probe questions (three clearly in-scope, three clearly out-of-scope) so you can see where a gap exists between the two groups, then asks you to pick a threshold value that sits in that gap and re-run to check that every question is now handled correctly.</div></div>
+            </div>
+            <div class="plain-english">
+              <span class="label">Plain English</span>
+              <p>Top-k search is like a helpful but overly agreeable assistant who, when asked to name your best restaurant option, will name <em>something</em> even if every restaurant in town is terrible — because "best of the options given" was the actual instruction. A threshold teaches the assistant to say "honestly, none of these are good" when that's the truth.</p>
+            </div>
+            <div class="callout danger">
+              <span class="label">Danger — this is the failure mode to internalize</span>
+              <p>Without a threshold, a RAG system can never refuse on its own. It will always find <em>a</em> "closest" runbook, cite it confidently, and generate a plausible-sounding but wrong answer. This is the classic hallucination path, and it starts in retrieval, not in the language model.</p>
+            </div>
+            <div class="example-box">
+              <span class="label">The gap you're looking for</span>
+              <p>In-scope questions like "How do I restart the payment service?" and "The message bus is falling behind" score clearly positive. Out-of-scope questions — the TLS certificate one, a refund-policy question, even "How do I bake sourdough bread?" — score noticeably lower. A threshold placed between the two groups turns "always answer something" into "answer only when actually confident, refuse otherwise."</p>
+            </div>
+            <div class="callout warn">
+              <span class="label">Trade-off — the same dial as alerting thresholds</span>
+              <p>Set the threshold <strong>too high</strong> and the system refuses questions it could have answered (false negatives). Set it <strong>too low</strong> and the hallucination path stays open (false positives). The notebook also challenges you to try to break your own threshold with a tricky out-of-scope question that happens to share a word with a runbook (e.g. "How do I restart my laptop?"). If one clever question defeats a hand-picked number, that's the argument for calibrated confidence scoring in production, rather than a single constant.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SECTION 9 -->
+      <section class="block" id="s9">
+        <h2>Section 9 — The final scoreboard</h2>
+        <p class="section-sub">Cell 43–44 · every retriever built in this notebook, measured on the same 10 questions</p>
+        <div class="cell">
+          <div class="cell-head"><span class="cell-index">9</span><span class="cell-title">Same eval set, six configurations, one table</span></div>
+          <div class="cell-body">
+            <div class="pwwh">
+              <div class="row problem"><div class="tag">Problem</div><div class="txt">Six different retrieval methods have been built across this notebook. Which one actually wins, and on what?</div></div>
+              <div class="row why"><div class="tag">Why</div><div class="txt">A single side-by-side table, using the exact same 10 questions for every method, is the only fair way to compare them — no method gets an easier test than another.</div></div>
+              <div class="row what"><div class="tag">What</div><div class="txt">Hit-rate at rank 1 ("hit@1"): does the single top-scoring chunk belong to the expected runbook? Reported for lexical questions, semantic questions, and overall, for every retriever.</div></div>
+              <div class="row how"><div class="tag">How</div><div class="txt">Each of the six retrievers plugs into the same reusable evaluation function built back in Section 2, and results are collected into one table and one grouped bar chart.</div></div>
+            </div>
+            <table class="cmp">
+              <thead><tr><th>Configuration</th><th>Lexical hit@1</th><th>Semantic hit@1</th><th>Overall</th></tr></thead>
+              <tbody>
+                <tr><td>TF-IDF (Notebook 1)</td><td>high</td><td>0.00</td><td>~0.50</td></tr>
+                <tr><td>BM25</td><td>high</td><td>low</td><td>moderate</td></tr>
+                <tr><td>MiniLM dense</td><td>high</td><td>high</td><td>high</td></tr>
+                <tr><td>Hybrid (alpha=0.5)</td><td>high</td><td>high</td><td>high</td></tr>
+                <tr><td>Hybrid (RRF)</td><td>high</td><td>high</td><td>high</td></tr>
+                <tr><td>MiniLM + cross-encoder</td><td>high</td><td>high</td><td>highest</td></tr>
+              </tbody>
+            </table>
+            <div class="diagram">
+              <div class="bars">
+                <div class="bar-row"><div class="label">TF-IDF (Notebook 1)</div><div class="track"><div class="fill" style="width:50%"></div></div><div class="val">~0.50</div></div>
+                <div class="bar-row"><div class="label">BM25</div><div class="track"><div class="fill" style="width:60%"></div></div><div class="val">moderate</div></div>
+                <div class="bar-row"><div class="label">MiniLM dense</div><div class="track"><div class="fill" style="width:85%"></div></div><div class="val">high</div></div>
+                <div class="bar-row"><div class="label">Hybrid (alpha=0.5)</div><div class="track"><div class="fill" style="width:88%"></div></div><div class="val">high</div></div>
+                <div class="bar-row"><div class="label">Hybrid (RRF)</div><div class="track"><div class="fill" style="width:88%"></div></div><div class="val">high</div></div>
+                <div class="bar-row"><div class="label">MiniLM + cross-encoder</div><div class="track"><div class="fill" style="width:95%"></div></div><div class="val">highest</div></div>
+              </div>
+            </div>
+            <div class="callout warn">
+              <span class="label">Read the fine print</span>
+              <p>Ten questions over ten chunks is a <strong>demonstration, not an experiment</strong>. One question flipping its result moves hit@1 by 0.10 — well inside the noise. Don't conclude "RRF beats alpha=0.5 in general" from a table this small. What the table legitimately teaches is the <em>method</em>: split your eval set by failure mode, change one component at a time, and read the per-category numbers rather than trusting a single aggregate score. Notebook 3 replaces this toy scoreboard with proper evaluation — RAGAS, larger sets, confidence intervals.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <hr class="hr">
+
+      <!-- RECAP -->
+      <section class="block" id="recap">
+        <h2>What you built</h2>
+        <p class="section-sub">The conclusion, translated</p>
+        <table class="cmp">
+          <thead><tr><th></th><th>Notebook 1</th><th>Notebook 2</th></tr></thead>
+          <tbody>
+            <tr><td>Turning text into numbers</td><td>TF-IDF — counts shared words</td><td>MiniLM — learns meaning</td></tr>
+            <tr><td>Where vectors are stored</td><td>a Python list, searched with a for-loop</td><td>FAISS index, built for fast lookup</td></tr>
+            <tr><td>How results are ranked</td><td>cosine similarity, top-k</td><td>+ a cross-encoder re-check on the shortlist</td></tr>
+            <tr><td>What gets matched</td><td>vocabulary only</td><td>+ BM25 keyword fusion, for exact identifiers</td></tr>
+            <tr><td>What gets searched</td><td>the whole corpus, every time</td><td>+ metadata pre-filtering, only the relevant slice</td></tr>
+          </tbody>
+        </table>
+        <div class="plain-english">
+          <span class="label">The transferable lesson</span>
+          <p>The point of this notebook was never "use MiniLM." It's the diagnostic loop: build an eval set that separates failure modes → change one component → read the per-category numbers → fix whichever component is actually the bottleneck. That loop is what separates engineers who tune RAG systems from engineers who guess at them.</p>
+        </div>
+        <div class="callout tip">
+          <span class="label">Coming up in Notebook 3</span>
+          <p>PostgreSQL + pgvector, HNSW indexing and its recall trade-off, proper evaluation with RAGAS, and observability — moving everything built here into a production-shaped system.</p>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <div class="pagenav">
+    <a href="notebook1.html"><div class="dir">← Previous</div><div class="name">Notebook 1 — RAG From Scratch (TF-IDF)</div></a>
+    <a href="notebook3.html" class="next"><div class="dir">Next →</div><div class="name">Notebook 3 — Production RAG with pgvector</div></a>
+  </div>
+
+</div>
+
+<footer class="site">
+  RAG From Scratch → Production · a 3-notebook series on building a Retrieval-Augmented Generation pipeline for SRE runbook search.
+</footer>
+
+</body>
+</html>

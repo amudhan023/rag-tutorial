@@ -1,0 +1,983 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Notebook 1 — Build RAG From Scratch | RAG From Scratch → Production</title>
+<meta name="description" content="A no-code, plain-English walkthrough of building a Retrieval-Augmented Generation pipeline from scratch with TF-IDF." />
+<link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="dot"></span> RAG From Scratch → Production</a>
+    <nav class="topnav">
+      <a href="index.html#notebooks">Notebooks</a>
+      <a href="index.html#concepts">Concepts</a>
+      <a href="notebook2.html">Notebook 2</a>
+      <a href="notebook3.html">Notebook 3</a>
+    </nav>
+  </div>
+</div>
+
+<div class="page">
+
+  <div class="hero">
+    <span class="eyebrow">Notebook 1 of 3</span>
+    <h1>Build RAG From Scratch — No Libraries, No Magic</h1>
+    <p class="lede">
+      This notebook builds a working "ask a question, get an answer from your own documents" system —
+      called <strong>Retrieval-Augmented Generation (RAG)</strong> — using nothing but plain Python, a bit of
+      math, and five made-up "SRE runbooks" (troubleshooting guides for on-call engineers). No fancy
+      libraries are hiding the mechanics. By the end, you'll understand exactly what happens between
+      "user types a question" and "system answers it" — and you'll watch this simple version <em>fail</em>
+      in two specific, memorable ways that motivate everything in Notebook 2.
+    </p>
+    <div class="hero-meta">
+      <span class="pill accent">Zero ML background required</span>
+      <span class="pill teal">No code shown</span>
+      <span class="pill purple">TF-IDF · cosine similarity · prompts</span>
+    </div>
+  </div>
+
+  <div class="layout-2col">
+    <aside class="toc">
+      <div class="toc-title">On this page</div>
+      <a href="#big-picture">The big picture</a>
+      <a href="#corpus">1. The 5 runbooks</a>
+      <a href="#cleaning">2. Cleaning</a>
+      <a href="#chunking">3. Chunking</a>
+      <a href="#overlap">3.1 The overlap problem</a>
+      <a href="#chunkset">3.2 The final chunk set</a>
+      <a href="#embeddings">4. Turning text into numbers</a>
+      <a href="#read-vector">4.1 Reading a vector</a>
+      <a href="#heatmap">4.2 The heatmap</a>
+      <a href="#pca">5. Seeing the map</a>
+      <a href="#vectordb">6. The "database"</a>
+      <a href="#search">7. Similarity search</a>
+      <a href="#failures">7.1 Where it breaks</a>
+      <a href="#prompt">8. Building the prompt</a>
+      <a href="#llm">9. The answer step</a>
+      <a href="#experiments">10. Turning the knobs</a>
+      <a href="#conclusion">Conclusion</a>
+    </aside>
+
+    <div>
+
+    <section class="block" id="big-picture">
+      <h2>The big picture, before any details</h2>
+      <p class="section-sub">What this whole notebook is building, in one breath.</p>
+
+      <div class="pwwh">
+        <div class="row problem">
+          <div class="tag">Problem</div>
+          <div class="txt">An on-call engineer gets paged at 3am: <strong>"payment service is down."</strong>
+          They don't want to read five 2-page troubleshooting documents. They want to type a question
+          and get the <em>right two paragraphs</em>, instantly.</div>
+        </div>
+        <div class="row why">
+          <div class="tag">Why</div>
+          <div class="txt">A general-purpose AI model (like ChatGPT) doesn't know your company's private
+          runbooks — it was never trained on them. If you ask it "how do I restart the payment service,"
+          it will either say "I don't know" or, worse, <strong>confidently make something up</strong>.</div>
+        </div>
+        <div class="row what">
+          <div class="tag">What</div>
+          <div class="txt"><strong>RAG (Retrieval-Augmented Generation)</strong> is a two-step trick:
+          first <em>retrieve</em> the most relevant pieces of your own documents, then hand those pieces
+          to the AI model and say "answer using <em>only</em> this." The model isn't guessing from memory —
+          it's reading an open book you handed it.</div>
+        </div>
+        <div class="row how">
+          <div class="tag">How</div>
+          <div class="txt">This notebook builds that pipeline step by step, showing every intermediate
+          result, using the simplest possible version of each piece.</div>
+        </div>
+      </div>
+
+      <div class="diagram">
+        <div class="flow vertical">
+          <div class="flow-step accent">5 SRE Runbooks (raw text)<span class="sub">messy documents with headers, page numbers, shell commands</span></div>
+          <div class="flow-arrow">↓</div>
+          <div class="flow-step">Cleaning<span class="sub">strip out boilerplate noise</span></div>
+          <div class="flow-arrow">↓</div>
+          <div class="flow-step">Chunking<span class="sub">cut into small overlapping paragraphs</span></div>
+          <div class="flow-arrow">↓</div>
+          <div class="flow-step teal">Embeddings (TF-IDF)<span class="sub">turn each chunk into a list of numbers</span></div>
+          <div class="flow-arrow">↓</div>
+          <div class="flow-step">Vector Store<span class="sub">just a Python list — that's it</span></div>
+          <div class="flow-arrow">↓</div>
+          <div class="flow-step purple">Similarity Search<span class="sub">find the closest-matching chunks by hand</span></div>
+          <div class="flow-arrow">↓</div>
+          <div class="flow-step">Prompt Builder<span class="sub">paste the matches into a message to the AI</span></div>
+          <div class="flow-arrow">↓</div>
+          <div class="flow-step orange">Answer<span class="sub">mock included — works with zero API key</span></div>
+        </div>
+      </div>
+
+      <div class="callout tip">
+        <span class="label">Why start with something so basic (TF-IDF) instead of a "real" AI model?</span>
+        <p>TF-IDF turns each chunk of text into a list of numbers where <strong>you can literally read what
+        each number means</strong> — "this chunk scores 0.72 on the word <code>kafka</code>." A modern neural
+        embedding is a black box: 384 numbers with no individual meaning. Learning the pipeline on the
+        "glass box" version first means when something breaks later, you'll already understand every moving
+        part — you're just swapping one black box in for a see-through one.</p>
+      </div>
+    </section>
+
+    <hr class="hr" />
+
+    <section class="block" id="corpus">
+      <h2>Step 1 — Give the system something to search</h2>
+      <div class="section-nav-jump">
+        <a href="#corpus">Overview</a>
+      </div>
+
+      <div class="cell">
+        <div class="cell-head"><span class="cell-index">Section 1</span><span class="cell-title">Creating five fake troubleshooting guides</span></div>
+        <div class="cell-body">
+          <div class="pwwh">
+            <div class="row problem">
+              <div class="tag">Problem</div>
+              <div class="txt">Before you can search anything, you need something to search. Downloading
+              real company documents would be messy and you wouldn't know exactly what's inside them —
+              which makes it hard to tell later <em>why</em> search got something wrong.</div>
+            </div>
+            <div class="row why">
+              <div class="tag">Why</div>
+              <div class="txt">The notebook writes 5 fake "runbooks" (documents like: <em>Payment Service
+              Outage</em>, <em>Order Service Degradation</em>, <em>Login Service Authentication Failures</em>,
+              <em>Kafka Cluster Incidents</em>, <em>Kubernetes Deployment Failures</em>) by hand — so you know
+              every single word in your search corpus, on purpose. That way, when a search result looks
+              wrong later, you can immediately tell if the <em>system</em> is broken or the <em>data</em>
+              just doesn't say that.</div>
+            </div>
+            <div class="row what">
+              <div class="tag">What</div>
+              <div class="txt">A <strong>corpus</strong> is just the fancy word for "the full collection of
+              documents you're going to search." Here it's 5 short text documents, each with a realistic
+              messy shape: a repeated <code>CONFIDENTIAL</code> stamp, page numbers, and troubleshooting
+              steps that include copy-pasted terminal commands.</div>
+            </div>
+            <div class="row how">
+              <div class="tag">How</div>
+              <div class="txt">The code stores the 5 documents in a simple lookup table (name → text), then
+              counts words per document and draws a bar chart, plus prints a little text "card" for each
+              one so it feels like a real, distinct item instead of one giant wall of text.</div>
+            </div>
+          </div>
+
+          <div class="plain-english">
+            <span class="label">Plain English</span>
+            <p>Think of this like setting up a filing cabinet with 5 labeled folders before you build a
+            filing assistant. You wrote all 5 folders yourself, so you know exactly what's inside each one —
+            which makes it obvious later whether your assistant is smart or just lucky.</p>
+          </div>
+
+          <div class="example-box">
+            <span class="label">Example — what one "runbook" actually looks like</span>
+            <p style="margin-bottom:8px;">The <code>payment-service</code> runbook, boiled down to its shape:</p>
+            <div class="stack">
+              <div class="stack-item"><span class="k">Header noise</span><span class="v">"CONFIDENTIAL - ACME Corp Internal", "Page 1 of 2"</span></div>
+              <div class="stack-item"><span class="k">Symptoms</span><span class="v">5xx errors, high latency, Redis timeouts</span></div>
+              <div class="stack-item"><span class="k">Investigation steps</span><span class="v">check pods, inspect logs, verify Redis</span></div>
+              <div class="stack-item"><span class="k">Remediation</span><span class="v">kubectl rollout restart deployment payment-api</span></div>
+            </div>
+          </div>
+
+          <div class="diagram">
+            <div class="bars">
+              <div class="bar-row"><span class="label">payment-service</span><div class="track"><div class="fill" style="width:74%"></div></div><span class="val">~110 words</span></div>
+              <div class="bar-row"><span class="label">order-service</span><div class="track"><div class="fill" style="width:62%"></div></div><span class="val">~90 words</span></div>
+              <div class="bar-row"><span class="label">login-service</span><div class="track"><div class="fill" style="width:60%"></div></div><span class="val">~85 words</span></div>
+              <div class="bar-row"><span class="label">kafka-cluster</span><div class="track"><div class="fill" style="width:82%"></div></div><span class="val">~120 words</span></div>
+              <div class="bar-row"><span class="label">kubernetes-deploys</span><div class="track"><div class="fill" style="width:66%"></div></div><span class="val">~95 words</span></div>
+            </div>
+          </div>
+
+          <div class="callout tip">
+            <span class="label">Notice the trap being set on purpose</span>
+            <p>The runbooks were written to include realistic messiness deliberately: repeated headers
+            (which will motivate <em>cleaning</em>), shell commands that span multiple lines (which will
+            motivate <em>chunk overlap</em>), and overlapping vocabulary between the Kafka and Kubernetes
+            runbooks — both mention "failures" and "kubectl" — which will motivate <em>re-ranking</em> in
+            Notebook 2. Every later lesson has its seed planted right here.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <hr class="hr" />
+
+    <section class="block" id="cleaning">
+      <h2>Step 2 — Cleaning: throwing away the noise</h2>
+
+      <div class="cell">
+        <div class="cell-head"><span class="cell-index">Section 2</span><span class="cell-title">Removing boilerplate before it pollutes the search</span></div>
+        <div class="cell-body">
+          <div class="pwwh">
+            <div class="row problem">
+              <div class="tag">Problem</div>
+              <div class="txt">Every single one of the 5 documents repeats the exact phrase
+              <code>CONFIDENTIAL - ACME Corp Internal</code> and page numbers like <code>Page 1 of 2</code>.</div>
+            </div>
+            <div class="row why">
+              <div class="tag">Why</div>
+              <div class="txt">Later, the system will judge "how similar" two chunks of text are. If every
+              single chunk contains the exact same stamp, that stamp makes <em>all</em> documents look a
+              little more alike than they really are — blurring the very thing you're trying to measure. It
+              carries zero useful signal about what a document is actually <em>about</em>, and it actively
+              muddies the comparison.</div>
+            </div>
+            <div class="row what">
+              <div class="tag">What</div>
+              <div class="txt"><strong>Cleaning</strong> means stripping out text that's just administrative
+              noise — headers, footers, page numbers, extra blank lines — before anything gets measured or
+              compared.</div>
+            </div>
+            <div class="row how">
+              <div class="tag">How</div>
+              <div class="txt">The code defines a short list of "patterns to delete" (anything starting with
+              "CONFIDENTIAL", anything matching "Page &lt;number&gt; of &lt;number&gt;"), scans every document
+              for text matching those patterns and removes it, then tidies up the double-spaces and extra
+              blank lines that deleting text leaves behind.</div>
+            </div>
+          </div>
+
+          <div class="plain-english">
+            <span class="label">Plain English</span>
+            <p>Imagine photocopying five different reports, but every single page has the same watermark
+            stamped across it. If you tried to judge "which two reports are most alike" by counting shared
+            ink, the watermark would make every pair look artificially similar. Cleaning is peeling that
+            watermark off before you compare anything.</p>
+          </div>
+
+          <div class="example-box">
+            <span class="label">Example — before and after</span>
+            <div class="stack">
+              <div class="stack-item"><span class="k">Before</span><span class="v">"CONFIDENTIAL - ACME Corp Internal · Page 1 of 2 · RUNBOOK: Payment Service Outage"</span></div>
+              <div class="stack-item"><span class="k">After</span><span class="v">"RUNBOOK: Payment Service Outage"</span></div>
+            </div>
+          </div>
+
+          <div class="callout warn">
+            <span class="label">Try this experiment (from the notebook itself)</span>
+            <p>If you skip this cleaning step entirely and re-run the search later, every document's
+            "similarity score" creeps up slightly — for the <em>wrong</em> reason. Noise doesn't make search
+            smarter, it just inflates everyone's score equally, which makes the real signal harder to spot.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <hr class="hr" />
+
+    <section class="block" id="chunking">
+      <h2>Step 3 — Chunking: cutting documents into bite-sized pieces</h2>
+
+      <div class="cell">
+        <div class="cell-head"><span class="cell-index">Section 3</span><span class="cell-title">Why we don't search whole documents</span></div>
+        <div class="cell-body">
+          <div class="pwwh">
+            <div class="row problem">
+              <div class="tag">Problem</div>
+              <div class="txt">If you ask "how do I restart the payment service," and the system compares
+              your question against <em>whole documents</em>, it will match the entire payment-service
+              runbook — including its unrelated Redis and escalation sections that have nothing to do with
+              restarting anything.</div>
+            </div>
+            <div class="row why">
+              <div class="tag">Why</div>
+              <div class="txt">Two reasons this matters. First, <strong>precision</strong>: smaller pieces
+              give sharper, more specific matches. Second, <strong>budget</strong>: the AI model you
+              eventually hand text to has a strict limit on how much text it can read at once (and it costs
+              real money per word) — you want to send only the 2–3 <em>most relevant</em> paragraphs, not
+              five entire documents.</div>
+            </div>
+            <div class="row what">
+              <div class="tag">What</div>
+              <div class="txt"><strong>Chunking</strong> means slicing every document into small overlapping
+              windows of text — say, 60 words at a time — so the system can retrieve just the one small piece
+              that actually answers the question.</div>
+            </div>
+            <div class="row how">
+              <div class="tag">How</div>
+              <div class="txt">The code slides a fixed-size "window" (e.g. 60 words) across each document,
+              moving forward a bit less than the full window size each step — which is what creates the
+              overlap explained next. Each resulting window of words becomes one "chunk."</div>
+            </div>
+          </div>
+
+          <div class="plain-english">
+            <span class="label">Plain English</span>
+            <p>Chunking is like cutting a long recipe book into individual recipe cards instead of forcing
+            someone to flip through the whole book to find "how do I make bread." Smaller cards mean whoever
+            is searching gets handed exactly the one card they need.</p>
+          </div>
+
+          <div class="diagram">
+            <p style="color:var(--text-mute); font-size:13px; margin:0 0 10px;">The core trade-off, made visible:</p>
+            <div class="flow">
+              <div class="flow-step pink">Chunks too small<span class="sub">precise matches, but commands/context get cut in half</span></div>
+              <div class="flow-arrow">⇄</div>
+              <div class="flow-step orange">Chunks too large<span class="sub">full context, but fuzzy matches and fat prompts</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="block" id="overlap">
+      <div class="cell">
+        <div class="cell-head"><span class="cell-index">Section 3.1</span><span class="cell-title">Watching a command get amputated at a chunk boundary</span></div>
+        <div class="cell-body">
+          <div class="pwwh">
+            <div class="row problem">
+              <div class="tag">Problem</div>
+              <div class="txt">A command like <code>kubectl rollout restart deployment payment-api</code>
+              might happen to sit exactly at the border between chunk 3 and chunk 4. If chunks don't
+              overlap at all, the first half of that command ends up in chunk 3 and the second half in
+              chunk 4 — and <strong>neither chunk contains the complete, useful command</strong>.</div>
+            </div>
+            <div class="row why">
+              <div class="tag">Why</div>
+              <div class="txt">A search for "how do I restart payments?" needs to find a chunk holding the
+              <em>whole</em> command. If the command is split across two chunks, neither chunk is a good
+              match — the answer effectively disappears, even though it was right there in the source
+              document.</div>
+            </div>
+            <div class="row what">
+              <div class="tag">What</div>
+              <div class="txt"><strong>Overlap</strong> means each new chunk repeats the last several words
+              of the previous chunk. So the "boundary region" — wherever a command happened to land — always
+              ends up living fully inside at least one chunk.</div>
+            </div>
+            <div class="row how">
+              <div class="tag">How</div>
+              <div class="txt">The notebook runs the exact same document through the chunker twice: once
+              with 0 words of overlap, once with 10 words of overlap — changing only that one setting — and
+              prints the boundary of each chunk so you can watch the command survive intact only in the
+              second version.</div>
+            </div>
+          </div>
+
+          <div class="example-box">
+            <span class="label">Example — the same boundary, two ways</span>
+            <p style="margin-bottom:10px;">Command: <code>kubectl rollout restart deployment payment-api</code></p>
+            <div class="chip-row">
+              <span class="chip">chunk 3 ends: ...pods in CrashLoopBackOff, restart the</span>
+              <span class="chip hl2">chunk 4 begins: deployment payment-api If Redis...</span>
+            </div>
+            <p style="margin:8px 0 4px; color:var(--text-mute); font-size:12.5px;">↑ overlap = 0 — the command is split. No single chunk contains it.</p>
+            <div class="chip-row">
+              <span class="chip overlap">chunk 3 ends: ...restart the deployment: kubectl rollout restart deployment payment-api</span>
+              <span class="chip overlap">chunk 4 begins: kubectl rollout restart deployment payment-api If Redis...</span>
+            </div>
+            <p style="margin:8px 0 0; color:var(--text-mute); font-size:12.5px;">↑ overlap = 10 words — the full command now appears intact in both neighboring chunks.</p>
+          </div>
+
+          <div class="callout warn">
+            <span class="label">Trade-off — overlap isn't free</span>
+            <p>Repeating words duplicates data. A 10-word overlap on a 40-word chunk is 25% storage overhead
+            — in a real production system that means real disk space and real embedding compute cost for
+            every document. Typical real-world values sit around 10–20% of the chunk size, not 25%. This
+            notebook settles on <strong>chunk size = 60 words, overlap = 12 words</strong> for everything
+            that follows — a fresh set of chunks that also now carries <strong>metadata</strong> (which
+            document each chunk came from, and a unique ID) so a result can always be traced back to its
+            source runbook.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <hr class="hr" />
+
+    <section class="block" id="embeddings">
+      <h2>Step 4 — Turning text into numbers a computer can compare</h2>
+
+      <div class="cell">
+        <div class="cell-head"><span class="cell-index">Section 4</span><span class="cell-title">TF-IDF: an embedding you can actually read</span></div>
+        <div class="cell-body">
+          <div class="pwwh">
+            <div class="row problem">
+              <div class="tag">Problem</div>
+              <div class="txt">Computers can't compare "meaning" directly. To ask "which chunk is most
+              similar to this question," you first need to turn every piece of text into <em>numbers</em> —
+              because comparing numbers is something math can do.</div>
+            </div>
+            <div class="row why">
+              <div class="tag">Why</div>
+              <div class="txt">The entire idea behind every search and AI-retrieval system boils down to
+              one sentence: <strong>turn text into numbers such that similar meaning produces nearby
+              numbers.</strong> Get that translation right, and "search" becomes "find the nearest numbers" —
+              a problem math is very good at solving.</div>
+            </div>
+            <div class="row what">
+              <div class="tag">What</div>
+              <div class="txt"><strong>TF-IDF</strong> (Term Frequency × Inverse Document Frequency) is the
+              simplest useful way to do that translation. In one breath: a word that shows up <em>often in
+              this one chunk</em> matters to that chunk (Term Frequency); a word that shows up in
+              <em>almost every chunk</em> — like "the," "check," "service" — carries no useful signal, so it
+              gets down-weighted (Inverse Document Frequency). Multiply those two together, and you get one
+              score per word, per chunk. Every chunk becomes a long list of numbers — one number per
+              distinct word across the whole corpus — called a <strong>vector</strong>.</div>
+            </div>
+            <div class="row how">
+              <div class="tag">How</div>
+              <div class="txt">The code scans every chunk once to build a "vocabulary" — every distinct word
+              used anywhere — dropping common filler words like "the" and "and." Then it scores each chunk
+              against that vocabulary, producing one row of numbers per chunk. With roughly 300 distinct
+              words across the corpus and only 10 chunks, almost every chunk uses just a handful of those
+              300 words — so the vast majority of each chunk's number-list is exactly zero.</div>
+            </div>
+          </div>
+
+          <div class="plain-english">
+            <span class="label">Plain English</span>
+            <p>Picture a giant spreadsheet. Every column is a distinct word that appears <em>anywhere</em>
+            in any runbook — "kafka," "kubectl," "redis," "login," and so on. Every row is one chunk of text.
+            Each cell in the spreadsheet says "how much does this word matter to this chunk?" A chunk about
+            Kafka lights up strongly in the "kafka," "broker," and "partition" columns and stays at zero
+            everywhere else. That row of numbers — the chunk's entire spreadsheet row — <em>is</em> its
+            vector.</p>
+          </div>
+
+          <div class="callout tip">
+            <span class="label">The one property that makes TF-IDF special</span>
+            <p>Because there's exactly one column per word, you can point at any single number in a chunk's
+            vector and say precisely which word it came from. A modern neural embedding (used in Notebook 2)
+            compresses everything into ~384 numbers that don't correspond to individual words at all — it's
+            a black box that understands synonyms, but you can't point at "number 213" and say what it
+            means. This notebook trades that power away on purpose, so you can watch the mechanism work in
+            full daylight first.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="cell" id="read-vector">
+        <div class="cell-head"><span class="cell-index">Section 4.1</span><span class="cell-title">Reading one chunk's vector with your own eyes</span></div>
+        <div class="cell-body">
+          <div class="pwwh">
+            <div class="row problem">
+              <div class="tag">Problem</div>
+              <div class="txt">A vector of ~300 numbers is abstract. It's hard to trust something you can't
+              inspect.</div>
+            </div>
+            <div class="row what">
+              <div class="tag">What</div>
+              <div class="txt">This step picks one real chunk (from the Kafka runbook) and prints its
+              <em>highest-scoring</em> words — proof that the numbers mean exactly what they claim to mean.</div>
+            </div>
+            <div class="row how">
+              <div class="tag">How</div>
+              <div class="txt">It sorts that one chunk's 300 numbers from highest to lowest and prints the
+              top 10 words next to their scores, with a simple bar made of block characters so you can see
+              the size difference at a glance.</div>
+            </div>
+          </div>
+
+          <div class="example-box">
+            <span class="label">Example — a Kafka chunk's top-weighted words</span>
+            <div class="bars">
+              <div class="bar-row"><span class="label">kafka</span><div class="track"><div class="fill" style="width:92%"></div></div><span class="val">0.46</span></div>
+              <div class="bar-row"><span class="label">broker</span><div class="track"><div class="fill" style="width:70%"></div></div><span class="val">0.35</span></div>
+              <div class="bar-row"><span class="label">partitions</span><div class="track"><div class="fill" style="width:64%"></div></div><span class="val">0.32</span></div>
+              <div class="bar-row"><span class="label">consumer</span><div class="track"><div class="fill" style="width:58%"></div></div><span class="val">0.29</span></div>
+              <div class="bar-row"><span class="label">replicated</span><div class="track"><div class="fill" style="width:44%"></div></div><span class="val">0.22</span></div>
+            </div>
+          </div>
+          <div class="plain-english">
+            <span class="label">Plain English</span>
+            <p>This is the "aha" moment of TF-IDF: the numbers aren't mysterious. A Kafka chunk scores high
+            on "kafka," "broker," and "partitions," and scores exactly zero on words like "redis" or
+            "login" that never appear in it. You can read a vector like a fingerprint of what a chunk talks
+            about.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="cell" id="heatmap">
+        <div class="cell-head"><span class="cell-index">Section 4.2</span><span class="cell-title">The heatmap — seeing the whole corpus's fingerprint at once</span></div>
+        <div class="cell-body">
+          <div class="pwwh">
+            <div class="row what">
+              <div class="tag">What</div>
+              <div class="txt">A grid picture: one row per chunk (grouped by which runbook it came from),
+              one column per one of the 25 most important words across the whole corpus, and the color of
+              each square shows how strongly that word matters to that chunk.</div>
+            </div>
+            <div class="row how">
+              <div class="tag">How</div>
+              <div class="txt">The code converts the full sparse number-grid to a plotting-friendly form,
+              picks the 25 words that reach the highest score <em>somewhere</em> in the corpus (ignoring
+              words that are never important to anyone), and draws them as a colored heatmap.</div>
+            </div>
+          </div>
+
+          <div class="plain-english">
+            <span class="label">Plain English</span>
+            <p>Imagine a lit-up grid where "Kafka words" glow bright only on the Kafka rows, and stay
+            completely dark everywhere else. That block-shaped glow pattern is visible proof that TF-IDF
+            actually separates topics — different documents light up completely different columns.</p>
+          </div>
+
+          <div class="callout win">
+            <span class="label">What to notice</span>
+            <p>Distinct rectangular blocks of color emerge — Kafka rows light up on Kafka-vocabulary
+            columns and stay dark on payment/login columns, and vice versa. That block structure is the
+            visual signature of "this simple method is actually separating topics correctly," at least
+            for topics with distinct vocabulary.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <hr class="hr" />
+
+    <section class="block" id="pca">
+      <h2>Step 5 — Drawing a map of the "meaning space"</h2>
+
+      <div class="cell">
+        <div class="cell-head"><span class="cell-index">Section 5</span><span class="cell-title">Squashing 300 dimensions down to 2, just so we can look at it</span></div>
+        <div class="cell-body">
+          <div class="pwwh">
+            <div class="row problem">
+              <div class="tag">Problem</div>
+              <div class="txt">Each chunk's vector lives in a space with ~300 dimensions (one per
+              vocabulary word). Humans can't visualize 300 dimensions.</div>
+            </div>
+            <div class="row why">
+              <div class="tag">Why</div>
+              <div class="txt">Seeing the actual "shape" of how chunks relate to each other — which ones
+              cluster together, which sit far apart — builds real intuition for what "similarity" means
+              before you trust a similarity <em>score</em> as just a number.</div>
+            </div>
+            <div class="row what">
+              <div class="tag">What</div>
+              <div class="txt"><strong>PCA (Principal Component Analysis)</strong> finds the 2 directions,
+              out of all ~300, along which the chunks vary the <em>most</em>, and projects every chunk's
+              vector down onto just those 2 — like taking a flattering photograph of a 3D object from
+              exactly the angle that shows its shape best. It's a lossy compression, done purely so a human
+              can look at a 2D scatter plot on a screen.</div>
+            </div>
+            <div class="row how">
+              <div class="tag">How</div>
+              <div class="txt">Each chunk becomes one dot with an (x, y) position; dots are colored by
+              which runbook they came from; the notebook plots all 10 dots on one chart.</div>
+            </div>
+          </div>
+
+          <div class="plain-english">
+            <span class="label">Plain English</span>
+            <p>Think of PCA like flattening a globe into a 2D map. You lose some accuracy at the edges, but
+            you gain the ability to actually look at the whole world at once. Here, PCA flattens 300-number
+            fingerprints into simple (x, y) dots you can eyeball on a chart.</p>
+          </div>
+
+          <div class="diagram">
+            <p style="color:var(--text-mute); font-size:13px; margin:0 0 14px;">A simplified sketch of what the scatter plot shows:</p>
+            <div style="display:flex; justify-content:center; gap:26px; flex-wrap:wrap;">
+              <span class="chip hl" style="padding:10px 16px;">● ● ● payment-service</span>
+              <span class="chip hl" style="padding:10px 16px;">● ● order-service</span>
+              <span class="chip hl" style="padding:10px 16px;">● ● login-service</span>
+            </div>
+            <p style="text-align:center; color:var(--text-mute); font-size:12.5px; margin:14px 0;">↑ these three cluster near each other — they all share "kubectl," "pods," "restart," "deployment"</p>
+            <div style="display:flex; justify-content:center; gap:26px; flex-wrap:wrap;">
+              <span class="chip hl2" style="padding:10px 16px;">● ● ● kafka-cluster</span>
+            </div>
+            <p style="text-align:center; color:var(--text-mute); font-size:12.5px; margin:14px 0 0;">↑ sits apart — different tooling vocabulary ("broker," "partitions," "lag")</p>
+          </div>
+
+          <div class="callout warn">
+            <span class="label">A hazard this map foreshadows</span>
+            <p>The <code>kubernetes-deploys</code> runbook lands <em>near</em> the three service runbooks
+            on this map, because they all talk about <code>kubectl</code>. That's a preview of a real
+            problem: <strong>shared vocabulary creates false neighbors</strong>. Two chunks can look similar
+            to a word-counting method just because they both mention the same tool, even when they're about
+            completely different incidents. Fixing this is exactly the job of "re-ranking," covered in
+            Notebook 2.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <hr class="hr" />
+
+    <section class="block" id="vectordb">
+      <h2>Step 6 — The "vector database" is just a list</h2>
+
+      <div class="cell">
+        <div class="cell-head"><span class="cell-index">Section 6</span><span class="cell-title">Demystifying what a vector database actually does</span></div>
+        <div class="cell-body">
+          <div class="pwwh">
+            <div class="row problem">
+              <div class="tag">Problem</div>
+              <div class="txt">Terms like "vector database," "pgvector," "FAISS," and "Pinecone" sound
+              intimidating and complicated, as if they're doing something fundamentally magical.</div>
+            </div>
+            <div class="row what">
+              <div class="tag">What</div>
+              <div class="txt">Underneath, any vector database does exactly two jobs: <strong>(1) store</strong>
+              pairs of (a vector, some descriptive info about it) and <strong>(2) given a new vector, return
+              the closest matches</strong>. That's it. This notebook's "database" is a plain Python list of
+              dictionaries — and its "search engine" is a for-loop that checks every item. That isn't a toy
+              simplification; it's the literal algorithm (called <em>brute-force nearest-neighbor search</em>)
+              that fancy databases only add speed tricks on top of, once you have millions of items instead
+              of ten.</div>
+            </div>
+            <div class="row how">
+              <div class="tag">How</div>
+              <div class="txt">Every chunk's vector, plus its source document name and chunk ID, gets
+              stored together as one record in a list. Then a hand-written function computes
+              <strong>cosine similarity</strong> — a score from -1 to 1 measuring how closely two vectors
+              "point in the same direction," regardless of their length — between any two vectors.</div>
+            </div>
+          </div>
+
+          <div class="plain-english">
+            <span class="label">Plain English — what is "cosine similarity"?</span>
+            <p>Imagine two arrows drawn from the same starting point. If they point in almost exactly the
+            same direction, the angle between them is small — "very similar." If they point in completely
+            different directions, the angle is large — "not similar." Cosine similarity measures that angle
+            and turns it into a single number: close to 1 means "pointing the same way" (very similar),
+            close to 0 means "unrelated." Crucially, it ignores how <em>long</em> each arrow is — so a short
+            chunk and a long chunk about the exact same topic can still score close to 1.</p>
+          </div>
+
+          <div class="example-box">
+            <span class="label">Sanity check the notebook runs before trusting the metric</span>
+            <div class="stack">
+              <div class="stack-item"><span class="k">cosine(kafka chunk, another kafka chunk)</span><span class="v">≈ 0.30 — same topic, meaningfully higher</span></div>
+              <div class="stack-item"><span class="k">cosine(kafka chunk, login chunk)</span><span class="v">≈ 0.02 — different topic, near zero</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <hr class="hr" />
+
+    <section class="block" id="search">
+      <h2>Step 7 — Actually searching: the most important step in the notebook</h2>
+
+      <div class="cell">
+        <div class="cell-head"><span class="cell-index">Section 7</span><span class="cell-title">Putting it all together into one search function</span></div>
+        <div class="cell-body">
+          <div class="pwwh">
+            <div class="row problem">
+              <div class="tag">Problem</div>
+              <div class="txt">Everything so far has been preparation. Now: given a real question typed by
+              a human, actually find the best-matching chunks.</div>
+            </div>
+            <div class="row what">
+              <div class="tag">What</div>
+              <div class="txt">The full search algorithm, in four steps: turn the question into a vector
+              using the exact same method used for the chunks → compute cosine similarity between the
+              question's vector and <em>every</em> chunk's vector → sort all chunks from most similar to
+              least → keep only the top few.</div>
+            </div>
+            <div class="row how">
+              <div class="tag">How</div>
+              <div class="txt">The question gets converted into a vector using the vocabulary that was
+              already learned from the documents — <strong>not</strong> a fresh vocabulary. Any word in the
+              question that never appeared anywhere in the runbooks is simply ignored, because there's no
+              column for it. Then the code loops through every stored chunk, computes its similarity to the
+              question, and returns the highest-scoring handful.</div>
+            </div>
+          </div>
+
+          <div class="callout danger">
+            <span class="label">One critical rule, and a real production bug it prevents</span>
+            <p>The question <strong>must</strong> be turned into a vector using the exact same vocabulary
+            that scored the documents. If a teammate accidentally embeds new questions with a
+            <em>different</em> method than the one used to build the stored chunks, the two sets of numbers
+            live in unrelated number-spaces — comparing them produces meaningless scores that still
+            <em>look</em> like normal output (no error message!), just quietly wrong. This exact bug
+            happens for real when someone upgrades an embedding model without re-processing the whole
+            document collection.</p>
+          </div>
+
+          <div class="example-box">
+            <span class="label">Example — search results for "How do I restart the payment service?"</span>
+            <div class="bars">
+              <div class="bar-row"><span class="label">payment-service#0</span><div class="track"><div class="fill" style="width:88%"></div></div><span class="val">0.44</span></div>
+              <div class="bar-row"><span class="label">payment-service#1</span><div class="track"><div class="fill" style="width:52%"></div></div><span class="val">0.26</span></div>
+              <div class="bar-row"><span class="label">kubernetes-deploys#0</span><div class="track"><div class="fill" style="width:24%"></div></div><span class="val">0.12</span></div>
+              <div class="bar-row"><span class="label">order-service#0</span><div class="track"><div class="fill" style="width:10%"></div></div><span class="val">0.05</span></div>
+              <div class="bar-row"><span class="label">login-service#0</span><div class="track"><div class="fill" style="width:6%"></div></div><span class="val">0.03</span></div>
+            </div>
+            <p style="margin-top:10px;">Exactly what you'd want: the two payment-service chunks dominate, with the loosely-related Kubernetes chunk a distant third.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="cell" id="failures">
+        <div class="cell-head"><span class="cell-index">Section 7.1</span><span class="cell-title">Probing where this simple method breaks — memorize these two</span></div>
+        <div class="cell-body">
+          <div class="pwwh">
+            <div class="row problem">
+              <div class="tag">Problem</div>
+              <div class="txt">Search works great when the question happens to share exact words with the
+              right document. Real on-call engineers don't always phrase things that conveniently.</div>
+            </div>
+          </div>
+
+          <div class="callout danger">
+            <span class="label">Failure 1 — Synonym blindness</span>
+            <p>The query <em>"The message bus is falling behind"</em> means exactly the same thing to any
+            SRE as "Kafka consumer lag is increasing." A human reads it instantly. But it scores
+            <strong>≈ 0.000</strong> against the Kafka runbook, because it shares <strong>zero exact
+            words</strong> with it — no "kafka," no "consumer," no "lag" anywhere in the query. TF-IDF only
+            ever matches literal strings, never meaning. This is the single biggest limitation this whole
+            notebook is building up to expose — and Notebook 2's neural embeddings fix precisely this.</p>
+          </div>
+
+          <div class="callout danger">
+            <span class="label">Failure 2 — Vocabulary collision</span>
+            <p>The query <em>"Customers see failures at checkout"</em> is obviously about payments. But it
+            retrieves the <strong>Kubernetes</strong> runbook instead, because the word "failures" happens
+            to be a strong, distinctive word inside that document ("pods stuck in
+            ImagePullBackOff/CrashLoopBackOff," "rollout stuck," etc.), while the payment-service runbook
+            never actually uses the word "failures" at all. The system matched the right <em>word</em>, in
+            completely the wrong <em>context</em>. Fixing this specific kind of mistake is the job of
+            "re-ranking," covered in Notebook 2.</p>
+          </div>
+
+          <div class="diagram">
+            <div class="bars">
+              <div class="bar-row"><span class="label">Kafka lag (exact words)</span><div class="track"><div class="fill" style="width:70%"></div></div><span class="val">0.34</span></div>
+              <div class="bar-row"><span class="label">"message bus falling behind"</span><div class="track"><div class="fill" style="width:1%"></div></div><span class="val">0.000</span></div>
+            </div>
+            <p style="margin-top:10px; color:var(--text-mute); font-size:13px;">Same real-world meaning, wildly different scores — because TF-IDF only counts shared letters, never shared ideas.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <hr class="hr" />
+
+    <section class="block" id="prompt">
+      <h2>Step 8 — Building the message you'll actually send to an AI model</h2>
+
+      <div class="cell">
+        <div class="cell-head"><span class="cell-index">Section 8</span><span class="cell-title">Pasting retrieved text into a prompt</span></div>
+        <div class="cell-body">
+          <div class="pwwh">
+            <div class="row problem">
+              <div class="tag">Problem</div>
+              <div class="txt">You've now found the right chunks. But an AI language model doesn't
+              automatically know to use them — you have to hand them over explicitly, in the message
+              ("prompt") you send it.</div>
+            </div>
+            <div class="row why">
+              <div class="tag">Why</div>
+              <div class="txt">RAG's whole trick, once you strip away the buzzwords, is almost
+              embarrassingly simple: <strong>paste the retrieved text straight into the prompt.</strong> Most
+              people using RAG systems never actually look at the assembled prompt — but you should, because
+              inspecting the exact prompt is the #1 debugging tool: it instantly answers "did the AI make
+              something up, or did retrieval hand it the wrong information in the first place?"</div>
+            </div>
+            <div class="row what">
+              <div class="tag">What</div>
+              <div class="txt">A prompt template with three real production design decisions baked in:
+              each retrieved chunk is labeled with exactly which document it came from (enabling citations
+              later), the instructions explicitly demand the model answer <em>only</em> from the provided
+              text (reducing made-up answers), and there's an explicit permission to say "I don't know" —
+              because a model needs to be told it's allowed to refuse, or it will often guess anyway.</div>
+            </div>
+            <div class="row how">
+              <div class="tag">How</div>
+              <div class="txt">The code re-runs the search from Step 7, stitches the top few chunks
+              together — each one tagged with its source ID and similarity score — into one block of
+              "context" text, and wraps it in instructions plus the original question.</div>
+            </div>
+          </div>
+
+          <div class="example-box">
+            <span class="label">Example — a real assembled prompt (simplified)</span>
+            <div class="stack">
+              <div class="stack-item"><span class="k">Instruction</span><span class="v">"Answer using ONLY the context below. Cite the source chunk id. If the context doesn't contain the answer, say so — don't guess."</span></div>
+              <div class="stack-item"><span class="k">Context</span><span class="v">[Source: payment-service#0 | similarity=0.44] "...restart the deployment: kubectl rollout restart deployment payment-api..."</span></div>
+              <div class="stack-item"><span class="k">Question</span><span class="v">"How do I restart the payment service?"</span></div>
+            </div>
+          </div>
+
+          <div class="callout tip">
+            <span class="label">Every retrieved chunk has a cost</span>
+            <p>Real AI APIs charge per "token" (a word-ish unit of text), and take longer to respond the
+            more text you send. Retrieving <code>k=3</code> chunks versus <code>k=8</code> chunks isn't just
+            a quality knob — it's directly a cost and speed knob too. This trade-off shows up constantly in
+            real production systems as a place to save money without hurting answer quality much.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <hr class="hr" />
+
+    <section class="block" id="llm">
+      <h2>Step 9 — Getting an actual answer back</h2>
+
+      <div class="cell">
+        <div class="cell-head"><span class="cell-index">Section 9</span><span class="cell-title">A free "fake AI" that proves the whole pipeline works end to end</span></div>
+        <div class="cell-body">
+          <div class="pwwh">
+            <div class="row problem">
+              <div class="tag">Problem</div>
+              <div class="txt">Sending the prompt to a real AI model (like GPT) normally costs money and
+              requires an API key — a real barrier if you just want to see the whole pipeline run once.</div>
+            </div>
+            <div class="row what">
+              <div class="tag">What</div>
+              <div class="txt">A <strong>mock LLM</strong> — a stand-in fake that doesn't understand
+              language at all, but mechanically pulls out anything that looks like a terminal command
+              (starting with <code>kubectl</code>, <code>redis-cli</code>, etc.) from the retrieved context
+              and lists it as the "answer." It proves every earlier stage — clean, chunk, embed, search,
+              build prompt — worked correctly, completely free.</div>
+            </div>
+            <div class="row how">
+              <div class="tag">How</div>
+              <div class="txt">A pattern-matching rule scans the context text for command-shaped text and
+              lists whatever it finds; if it finds nothing, it replies "I don't have a runbook for that." A
+              real AI model can be swapped in later by uncommenting a few lines and pasting in an API key —
+              nothing else about the pipeline changes.</div>
+            </div>
+          </div>
+
+          <div class="callout tip">
+            <span class="label">A real bug the notebook authors hit while building this</span>
+            <p>Their word-based chunker joined words back together with plain spaces, which quietly
+            <strong>destroyed line breaks</strong> — so trying to extract "command lines" line-by-line found
+            nothing at all, even though the commands were still there as plain text. The fix was matching
+            commands by their shape (regex) instead of relying on line breaks. The broader lesson: chunking
+            can silently throw away a document's structure (line breaks, tables, code blocks) in ways that
+            don't show up as an error — they show up as a feature quietly not working.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <hr class="hr" />
+
+    <section class="block" id="experiments">
+      <h2>Step 10 — The experiment that reveals the real bottleneck</h2>
+
+      <div class="cell">
+        <div class="cell-head"><span class="cell-index">Section 10</span><span class="cell-title">Turning the chunking knobs and measuring what actually changes</span></div>
+        <div class="cell-body">
+          <div class="pwwh">
+            <div class="row problem">
+              <div class="tag">Problem</div>
+              <div class="txt">Does making chunks bigger or smaller, or adding more overlap, actually fix
+              the two failures from Section 7.1?</div>
+            </div>
+            <div class="row why">
+              <div class="tag">Why</div>
+              <div class="txt">This is the notebook's core teaching moment. Teams building real retrieval
+              systems commonly spend weeks tweaking chunk size when the real problem lies somewhere entirely
+              different — a systematic way to measure "which knob actually matters" saves that wasted
+              effort.</div>
+            </div>
+            <div class="row what">
+              <div class="tag">What</div>
+              <div class="txt">A small <strong>test set</strong> of 10 questions with known correct answers,
+              deliberately split into two halves: 5 "easy" questions that share exact vocabulary with their
+              answer, and 5 "hard" paraphrased questions that mean the same thing but use different words.
+              For each combination of chunk size and overlap, the notebook rebuilds the whole search index
+              from scratch and measures <strong>hit@1</strong> — "for what fraction of test questions was
+              the single top search result actually correct?"</div>
+            </div>
+            <div class="row how">
+              <div class="tag">How</div>
+              <div class="txt">It sweeps chunk size across 20, 40, 60, 100, and 200 words, at both 0% and
+              20% overlap — 10 total configurations — rebuilding the index and re-scoring all 10 questions
+              each time, then plots hit@1 against chunk size as a line chart.</div>
+            </div>
+          </div>
+
+          <div class="diagram">
+            <p style="color:var(--text-mute); font-size:13px; margin:0 0 10px;">What the result line actually looks like — flat, at every setting:</p>
+            <div class="bars">
+              <div class="bar-row"><span class="label">chunk size 20</span><div class="track"><div class="fill" style="width:50%"></div></div><span class="val">0.50</span></div>
+              <div class="bar-row"><span class="label">chunk size 40</span><div class="track"><div class="fill" style="width:50%"></div></div><span class="val">0.50</span></div>
+              <div class="bar-row"><span class="label">chunk size 60</span><div class="track"><div class="fill" style="width:50%"></div></div><span class="val">0.50</span></div>
+              <div class="bar-row"><span class="label">chunk size 100</span><div class="track"><div class="fill" style="width:50%"></div></div><span class="val">0.50</span></div>
+              <div class="bar-row"><span class="label">chunk size 200</span><div class="track"><div class="fill" style="width:50%"></div></div><span class="val">0.50</span></div>
+            </div>
+          </div>
+
+          <div class="callout danger">
+            <span class="label">Read this flat line — it's the single most important result in the notebook</span>
+            <p>Hit@1 sits at roughly 0.5 no matter what chunk size or overlap you choose. The 5 "easy"
+            (lexical) questions succeed every time; the 5 "paraphrased" (semantic) questions fail every
+            time. Turning the chunking knobs changes <em>nothing</em>, because chunking was never the
+            problem — the problem is that <strong>TF-IDF cannot represent meaning, only exact vocabulary,
+            no matter how you slice the text.</strong> Notebook 2 swaps in a model that actually understands
+            paraphrasing and re-runs this exact same table.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <hr class="hr" />
+
+    <section class="block" id="conclusion">
+      <h2>Conclusion — what you actually built</h2>
+
+      <div class="diagram">
+        <div class="flow">
+          <div class="flow-step">text</div><div class="flow-arrow">→</div>
+          <div class="flow-step">clean</div><div class="flow-arrow">→</div>
+          <div class="flow-step">chunk (+overlap)</div><div class="flow-arrow">→</div>
+          <div class="flow-step teal">vectorize</div><div class="flow-arrow">→</div>
+          <div class="flow-step">store (list)</div><div class="flow-arrow">→</div>
+          <div class="flow-step purple">cosine top-k</div><div class="flow-arrow">→</div>
+          <div class="flow-step">prompt</div><div class="flow-arrow">→</div>
+          <div class="flow-step orange">LLM</div>
+        </div>
+      </div>
+
+      <p>Every production RAG system — no matter how sophisticated — is this exact same 8-step pipeline with
+      better parts substituted in. Notebook 2 replaces the two weakest parts (the embedding method and the
+      brute-force search loop) while keeping the overall shape identical:</p>
+
+      <table class="cmp">
+        <thead><tr><th>Piece</th><th>This notebook</th><th>Notebook 2</th></tr></thead>
+        <tbody>
+          <tr><td>Turning text into numbers</td><td>TF-IDF (readable, word-counting)</td><td>Sentence-transformer embeddings (learned, understands meaning)</td></tr>
+          <tr><td>Storage / search</td><td>Python list + for-loop</td><td>FAISS (fast approximate search index)</td></tr>
+          <tr><td>Ranking</td><td>Cosine similarity top-k only</td><td>+ cross-encoder re-ranking</td></tr>
+          <tr><td>Matching style</td><td>Vocabulary only</td><td>+ keyword (BM25) hybrid search</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout win">
+        <span class="label">The two failures to carry forward</span>
+        <p><strong>1. Synonym blindness</strong> — "the message bus is falling behind" scored 0.000 against
+        the correct answer, purely because it shares no exact words with it. <strong>2. Vocabulary
+        collision</strong> — "customers see failures at checkout" retrieved the wrong document because a
+        single shared word ("failures") outweighed the actual topic. Keep both of these in mind heading into
+        Notebook 2 — you'll watch them get fixed, one at a time, and see exactly which fix solves which
+        problem.</p>
+      </div>
+    </section>
+
+    <div class="pagenav">
+      <span></span>
+      <a class="next" href="notebook2.html">
+        <div class="dir">Next</div>
+        <div class="name">Notebook 2 — Modern Semantic RAG →</div>
+      </a>
+    </div>
+
+    </div>
+  </div>
+</div>
+
+<footer class="site">
+  RAG From Scratch → Production — a 3-notebook walkthrough of building, improving, and productionizing a Retrieval-Augmented Generation search system.
+</footer>
+
+</body>
+</html>
